@@ -285,21 +285,16 @@ class WorkspaceStoreImpl extends EventEmitter<WorkspaceStoreEvents> {
 		}
 	}
 
-	async uploadFiles(parentPath: string, fileList: FileList | File[]): Promise<void> {
+	async uploadFiles(parentPath: string, fileList: FileList | File[], conversationId?: string): Promise<void> {
 		this.isMutating = true;
 		this.emit("change", undefined);
 		try {
-			const items: Array<{ path: string; dataBase64: string }> = [];
+			const items: Array<{ path: string; file: File }> = [];
 			for (const file of Array.from(fileList)) {
-				const buffer = await file.arrayBuffer();
-				const bytes = new Uint8Array(buffer);
-				let binary = "";
-				for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-				const base64 = btoa(binary);
 				const filePath = parentPath ? `${parentPath}/${file.name}` : file.name;
-				items.push({ path: filePath, dataBase64: base64 });
+				items.push({ path: filePath, file });
 			}
-			await uploadWorkspaceFiles(items, this.wsId);
+			await uploadWorkspaceFiles(items, this.wsId, conversationId);
 			await this.loadTree();
 		} catch (err) {
 			this.error = err instanceof Error ? err.message : "Failed to upload";
@@ -315,16 +310,7 @@ class WorkspaceStoreImpl extends EventEmitter<WorkspaceStoreEvents> {
 		this.error = "";
 		this.emit("change", undefined);
 		try {
-			const dataBase64 = await new Promise<string>((resolve, reject) => {
-				const reader = new FileReader();
-				reader.onload = () => {
-					const result = String(reader.result ?? "");
-					resolve(result.includes(",") ? result.split(",")[1] : result);
-				};
-				reader.onerror = () => reject(reader.error ?? new Error("Failed to read file"));
-				reader.readAsDataURL(file);
-			});
-			await uploadWorkspaceSkill(file.name, dataBase64, this.wsId);
+			await uploadWorkspaceSkill(file, this.wsId);
 			await this.loadTree();
 		} catch (err) {
 			this.error = err instanceof Error ? err.message : "Failed to install skill";

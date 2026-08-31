@@ -543,11 +543,25 @@
 		"composerPlaceholder": "Type a message…"
 	},
 	"question": {
-		"typeSomething": "Type something…",
-		"chatAboutThis": "Chat about this",
-		"submit": "Submit",
+		"typeSomething": "Type your preference, objection, or what you do not understand…",
+		"chatAboutThis": "Switch to regular chat",
+		"submit": "Submit choices",
 		"submitNext": "Next",
-		"optionSelectedHint": "Option selected; deselect to enter custom text"
+		"decisionTitle": "Your decision is needed",
+		"decisionDescription": "Choose the option that best matches your view. For unfamiliar concepts, choose an “I don’t understand” option or add a note below.",
+		"referenceImage": "Reference image for this question",
+		"openImage": "The reference image is shown in the conversation; click to view the original",
+		"singleSelectHint": "Single choice; you can also enter a different preference.",
+		"multiSelectHint": "Multiple choices allowed; select every option that applies.",
+		"customAnswer": "No option fits? Enter your own answer",
+		"optionalNote": "Reason, question, or objection (optional)",
+		"optionalNotePlaceholder": "Explain your choice or note what you want clarified…",
+		"multiNotePlaceholder": "Select at least one option, then optionally add context here…",
+		"progress": "Question {{current}} of {{total}}",
+		"completeMissing": "{{count}} question(s) left",
+		"submitting": "Submitting",
+		"submitError": "Submission failed",
+		"submitErrorDetail": "Your choices were kept because submission failed. Please retry. {{error}}"
 	},
 	"sidebar": {
 		"expand": "Expand",
@@ -647,6 +661,7 @@
 		"内容创作": "Content Creation",
 		"文档处理": "Document Processing",
 		"研究检索": "Research & Retrieval",
+		"研究与分析": "Research & Analysis",
 		"开发工具": "Developer Tools",
 		"教学": "Teaching",
 		"演示": "Presentation"

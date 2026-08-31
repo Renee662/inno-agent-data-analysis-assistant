@@ -1,0 +1,4 @@
+interface:
+  display_name: "确认数据处理方案"
+  short_description: "Review user choices and approve a data-preparation plan"
+  default_prompt: "Use $confirm-data-preparation to review and approve a draft data-preparation plan without changing the data."

@@ -1,4 +1,5 @@
-import { apiFetch } from "./client.js";
+import { ApiError } from "./client.js";
+import { assertFileWithinUploadLimit } from "./upload-limits.js";
 
 export interface RawUploadResult {
 	fileName: string;
@@ -7,25 +8,17 @@ export interface RawUploadResult {
 	rawPath: string;
 }
 
-export function arrayBufferToBase64(buffer: ArrayBuffer): string {
-	let binary = "";
-	const bytes = new Uint8Array(buffer);
-	const chunkSize = 0x8000;
-	for (let i = 0; i < bytes.length; i += chunkSize) {
-		const chunk = bytes.subarray(i, i + chunkSize);
-		binary += String.fromCharCode(...chunk);
-	}
-	return btoa(binary);
-}
-
 export async function uploadRawFile(file: File): Promise<RawUploadResult> {
-	const dataBase64 = arrayBufferToBase64(await file.arrayBuffer());
-	return apiFetch<RawUploadResult>("/api/l2/raw/upload", {
+	assertFileWithinUploadLimit(file);
+	const params = new URLSearchParams({ fileName: file.name });
+	const response = await fetch(`/api/l2/raw/upload?${params.toString()}`, {
 		method: "POST",
-		body: JSON.stringify({
-			fileName: file.name,
-			mimeType: file.type || "application/octet-stream",
-			dataBase64,
-		}),
+		headers: { "Content-Type": file.type || "application/octet-stream" },
+		body: file,
 	});
+	if (!response.ok) {
+		const body = await response.json().catch(() => ({}));
+		throw new ApiError(response.status, (body as Record<string, string>).error || response.statusText);
+	}
+	return response.json() as Promise<RawUploadResult>;
 }

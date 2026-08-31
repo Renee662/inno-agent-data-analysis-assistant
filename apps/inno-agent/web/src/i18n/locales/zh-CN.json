@@ -543,11 +543,25 @@
 		"composerPlaceholder": "输入消息…"
 	},
 	"question": {
-		"typeSomething": "输入自定义答案…",
-		"chatAboutThis": "直接聊聊",
-		"submit": "提交",
+		"typeSomething": "直接填写你的想法、异议或不理解的地方…",
+		"chatAboutThis": "改用普通对话说明",
+		"submit": "提交选择",
 		"submitNext": "下一题",
-		"optionSelectedHint": "已选择选项，如需自定义请先取消选择"
+		"decisionTitle": "需要你的决定",
+		"decisionDescription": "请选择最符合你想法的选项；遇到不清楚的专业内容，可以直接选择“不理解”或在下方补充。",
+		"referenceImage": "本题参考图",
+		"openImage": "本题参考图已显示在对话中；点击可查看原图",
+		"singleSelectHint": "单选；如果推荐方案不合适，也可以直接填写你的意见。",
+		"multiSelectHint": "可多选；请勾选所有符合的选项。",
+		"customAnswer": "没有合适选项？直接填写",
+		"optionalNote": "补充说明或异议（选填）",
+		"optionalNotePlaceholder": "可说明为什么这样选择，或写下需要解释的地方…",
+		"multiNotePlaceholder": "请先选择至少一项，也可以在这里补充说明…",
+		"progress": "第 {{current}} / {{total}} 题",
+		"completeMissing": "还需回答 {{count}} 题",
+		"submitting": "正在提交",
+		"submitError": "提交失败",
+		"submitErrorDetail": "提交没有成功，已保留你的选择。请重试。{{error}}"
 	},
 	"sidebar": {
 		"expand": "展开",
@@ -647,6 +661,7 @@
 		"内容创作": "内容创作",
 		"文档处理": "文档处理",
 		"研究检索": "研究检索",
+		"研究与分析": "研究与分析",
 		"开发工具": "开发工具",
 		"教学": "教学",
 		"演示": "演示"

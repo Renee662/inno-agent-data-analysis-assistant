@@ -1,0 +1,4 @@
+interface:
+  display_name: "关系分析方案规划"
+  short_description: "确认因变量、解释变量、控制变量和分析目标并生成待确认方案"
+  default_prompt: "Use $plan-relationship-analysis to turn my research question into a validated analysis task card."

@@ -5,7 +5,7 @@ import "source-map-support/register.js";
 import { createServer, type IncomingMessage as HttpReq, type ServerResponse } from "node:http";
 import { spawnSync, execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, watch, writeFileSync } from "node:fs";
+import { cpSync, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, watch, writeFileSync } from "node:fs";
 import type { Dirent } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -54,8 +54,13 @@ import { randomUUID } from "node:crypto";
 import { logger } from "./logger.js";
 import { applyRuntimeEnvironment, parseRuntimeArgs, resolveRuntimePaths } from "./runtime.js";
 import { questionBridge, type QuestionBridgeResult } from "./agent/question-bridge.js";
+import { userFacingTextFromAssistantMessage } from "./agent/user-facing-output.js";
 import { DEFAULT_WORKSPACE_ID, TEMP_WORKSPACE_ID, WorkspaceRegistry } from "./workspace/workspace-registry.js";
 import { listPresets, listRemotePresets, ensurePresetCached, instantiatePreset } from "./presets/preset-store.js";
+import {
+	isDataAnalysisWorkspacePath,
+	resolveDataAnalysisConversationPaths,
+} from "./agent/data-analysis-runtime-policy.js";
 import { createContentSource, type RemoteContentSource } from "./content-source/index.js";
 import { mapWithConcurrency } from "./content-source/types.js";
 import { RunRecordStore } from "./terminal/run-record-store.js";
@@ -72,7 +77,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 // ensures a hung connection can't live longer than 15 minutes even if the
 // provider timeout fails to abort.
 setGlobalDispatcher(new EnvHttpProxyAgent({ bodyTimeout: 900_000, headersTimeout: 0 }));
-installFetchLogger();
+installFetchLogger({ getSessionId: () => getCurrentSessionId() });
 
 const parsed = parseRuntimeArgs(process.argv.slice(2));
 const paths = resolveRuntimePaths(parsed.options);
@@ -144,7 +149,9 @@ function piEventToSseEvent(event: any): unknown | null {
 	switch (event.type) {
 		case "message_update": {
 			const ev = event.assistantMessageEvent;
-			if (ev.type === "text_delta") return { type: "text_delta", delta: ev.delta };
+			// Buffer ordinary text until message_end. Text emitted before a tool call
+			// is often internal work narration even though it is not a thinking block.
+			if (ev.type === "text_delta") return null;
 			if (ev.type === "thinking_delta") return { type: "thinking_delta", delta: ev.delta };
 			if (ev.type === "toolcall_start" || ev.type === "toolcall_delta" || ev.type === "toolcall_end") {
 				return toolCallStreamEventFromAssistantEvent(ev);
@@ -157,7 +164,8 @@ function piEventToSseEvent(event: any): unknown | null {
 			if (msg && typeof msg === "object" && "stopReason" in msg && msg.stopReason === "error") {
 				return { type: "error", message: msg.errorMessage || "The model request failed." };
 			}
-			return null;
+			const visibleText = userFacingTextFromAssistantMessage(msg);
+			return visibleText ? { type: "text_delta", delta: visibleText } : null;
 		}
 		case "tool_execution_start":
 			return { type: "tool_start", toolCallId: event.toolCallId, toolName: event.toolName, args: event.args };
@@ -192,7 +200,7 @@ function piEventToChannelStreamEvent(event: any): ChannelStreamEvent | null {
 	switch (event.type) {
 		case "message_update": {
 			const ev = event.assistantMessageEvent;
-			if (ev.type === "text_delta") return { type: "text_delta", delta: ev.delta };
+			if (ev.type === "text_delta") return null;
 			if (ev.type === "thinking_delta") return { type: "thinking_delta", delta: ev.delta };
 			if (ev.type === "error") return { type: "error", message: ev.error?.errorMessage || "LLM API error" };
 			return null;
@@ -202,7 +210,8 @@ function piEventToChannelStreamEvent(event: any): ChannelStreamEvent | null {
 			if (msg && typeof msg === "object" && "stopReason" in msg && msg.stopReason === "error") {
 				return { type: "error", message: msg.errorMessage || "The model request failed." };
 			}
-			return null;
+			const visibleText = userFacingTextFromAssistantMessage(msg);
+			return visibleText ? { type: "text_delta", delta: visibleText } : null;
 		}
 		case "tool_execution_start":
 			return { type: "tool_start", toolCallId: event.toolCallId, toolName: event.toolName };
@@ -429,13 +438,103 @@ async function reloadFeishuChannel(): Promise<void> {
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
-function readBody(req: HttpReq): Promise<unknown> {
-	return new Promise((resolve, reject) => {
-		let data = "";
+const MAX_JSON_BODY_BYTES = 2 * 1024 * 1024;
+const MAX_CSV_UPLOAD_BYTES = 50 * 1024 * 1024;
+const MAX_EXCEL_UPLOAD_BYTES = 25 * 1024 * 1024;
+const MAX_GENERAL_UPLOAD_BYTES = 50 * 1024 * 1024;
+const MAX_SKILL_UPLOAD_BYTES = 25 * 1024 * 1024;
+
+class RequestTooLargeError extends Error {
+	constructor(public readonly maxBytes: number) {
+		super(`Request exceeds the ${Math.floor(maxBytes / (1024 * 1024))} MB limit`);
+		this.name = "RequestTooLargeError";
+	}
+}
+
+function uploadLimitForPath(filePath: string): number {
+	const ext = extname(filePath).toLowerCase();
+	if (ext === ".csv" || ext === ".tsv" || ext === ".txt") return MAX_CSV_UPLOAD_BYTES;
+	if (ext === ".xlsx" || ext === ".xls") return MAX_EXCEL_UPLOAD_BYTES;
+	if (ext === ".zip" || ext === ".md") return MAX_SKILL_UPLOAD_BYTES;
+	return MAX_GENERAL_UPLOAD_BYTES;
+}
+
+function validateContentLength(req: HttpReq, maxBytes: number): void {
+	const raw = req.headers["content-length"];
+	const length = typeof raw === "string" ? Number.parseInt(raw, 10) : Number.NaN;
+	if (Number.isFinite(length) && length > maxBytes) throw new RequestTooLargeError(maxBytes);
+}
+
+async function streamRequestToFile(req: HttpReq, destination: string, maxBytes: number): Promise<number> {
+	try {
+		validateContentLength(req, maxBytes);
+	} catch (err) {
+		req.resume();
+		throw err;
+	}
+	return new Promise<number>((resolvePromise, rejectPromise) => {
+		let received = 0;
+		let settled = false;
+		const writer = createWriteStream(destination, { flags: "wx" });
+		const removePartial = () => {
+			try { rmSync(destination, { force: true }); } catch { /* close event retries cleanup */ }
+		};
+		const failStream = (err: unknown) => {
+			if (settled) return;
+			settled = true;
+			writer.once("close", removePartial);
+			writer.destroy();
+			removePartial();
+			rejectPromise(err);
+		};
 		req.on("data", (chunk: Buffer) => {
+			if (settled) return;
+			received += chunk.length;
+			if (received > maxBytes) {
+				failStream(new RequestTooLargeError(maxBytes));
+				return;
+			}
+			if (!writer.write(chunk)) req.pause();
+		});
+		writer.on("drain", () => req.resume());
+		req.on("end", () => {
+			if (!settled) writer.end();
+		});
+		req.on("error", failStream);
+		req.on("aborted", () => failStream(new Error("Upload aborted")));
+		writer.on("error", failStream);
+		writer.on("finish", () => {
+			if (settled) return;
+			settled = true;
+			resolvePromise(received);
+		});
+	});
+}
+
+function readBody(req: HttpReq, maxBytes = MAX_JSON_BODY_BYTES): Promise<unknown> {
+	return new Promise((resolve, reject) => {
+		try {
+			validateContentLength(req, maxBytes);
+		} catch (err) {
+			reject(err);
+			return;
+		}
+		let data = "";
+		let received = 0;
+		let tooLarge = false;
+		req.on("data", (chunk: Buffer) => {
+			if (tooLarge) return;
+			received += chunk.length;
+			if (received > maxBytes) {
+				tooLarge = true;
+				data = "";
+				reject(new RequestTooLargeError(maxBytes));
+				return;
+			}
 			data += chunk.toString();
 		});
 		req.on("end", () => {
+			if (tooLarge) return;
 			try {
 				resolve(data ? JSON.parse(data) : {});
 			} catch (err) {
@@ -733,6 +832,27 @@ function safeWorkspacePath(workspaceId: string | null | undefined, userPath: str
 	const root = workspaceRegistry.resolveWorkspaceDir(workspaceId ?? TEMP_WORKSPACE_ID);
 	if (!root) return null;
 	return safeJoin(root, userPath.replace(/^\/+/, ""));
+}
+
+/** Return a collision-free file path without ever replacing an existing upload. */
+function versionedUploadPath(requestedPath: string): string {
+	if (!existsSync(requestedPath)) return requestedPath;
+	const extension = extname(requestedPath);
+	const stem = basename(requestedPath, extension);
+	const parent = dirname(requestedPath);
+	for (let version = 2; version < 10_000; version += 1) {
+		const candidate = join(parent, `${stem} (${version})${extension}`);
+		if (!existsSync(candidate)) return candidate;
+	}
+	throw new Error(`Too many uploaded versions for ${basename(requestedPath)}`);
+}
+
+function safeUploadedFileName(value: string): string {
+	const leaf = basename(value)
+		.replace(/[\\/?%*:|"<>\u0000-\u001f]/g, "_")
+		.replace(/[. ]+$/g, "")
+		.trim();
+	return leaf || `upload-${Date.now()}`;
 }
 
 function workspaceIdFromQuery(url: string): string {
@@ -1388,7 +1508,7 @@ interface WorkspaceTreeNode {
 }
 
 function workspaceRelativePath(rootDir: string, filePath: string): string {
-	return relative(rootDir, filePath) || "";
+	return (relative(rootDir, filePath) || "").split(sep).join("/");
 }
 
 interface WorkspaceFileChange {
@@ -1980,16 +2100,13 @@ function parseSessionFile(filePath: string): { summary: SessionSummary; messages
 			if (role === "assistant") {
 				const pending = ensureAssistant(ts);
 				if (entryChannel && !pending.channel) pending.channel = entryChannel;
+				const visibleText = userFacingTextFromAssistantMessage(message);
 				const content = message.content;
 				if (Array.isArray(content)) {
 					for (const part of content) {
 						if (!part || typeof part !== "object") continue;
 						const block = part as Record<string, unknown>;
-						if (block.type === "text" && typeof block.text === "string") {
-							pending.content = pending.content
-								? `${pending.content}\n${block.text}`
-								: block.text;
-						} else if (block.type === "thinking" && typeof block.thinking === "string") {
+						if (block.type === "thinking" && typeof block.thinking === "string") {
 							pending.thinking = pending.thinking
 								? `${pending.thinking}\n${block.thinking}`
 								: block.thinking;
@@ -2001,9 +2118,8 @@ function parseSessionFile(filePath: string): { summary: SessionSummary; messages
 							pending.tools.push({ toolCallId, toolName, args });
 						}
 					}
-				} else if (typeof content === "string" && content) {
-					pending.content = pending.content ? `${pending.content}\n${content}` : content;
 				}
+				if (visibleText) pending.content = visibleText;
 				pending.timestamp = ts;
 				// If this assistant entry ended the turn (stopReason "stop"), finalize.
 				if (typeof message.stopReason === "string" && message.stopReason !== "toolUse") {
@@ -2031,9 +2147,10 @@ function parseSessionFile(filePath: string): { summary: SessionSummary; messages
 		}
 		finalizeAssistant();
 
-		// Filter out empty assistant entries (no text, no thinking, no tools).
+		// Thinking and tool records remain available for diagnostics, but are not
+		// standalone conversation messages when there is no user-facing answer.
 		const filtered = messages.filter((m) =>
-			m.role === "user" ? !!m.content : (m.content || m.thinking || (m.tools && m.tools.length > 0)),
+			m.role === "user" ? !!m.content : !!m.content,
 		);
 
 		const firstUser = filtered.find((message) => message.role === "user");
@@ -2550,23 +2667,31 @@ const server = createServer(async (req, res) => {
 			return;
 		}
 
-		if (method === "POST" && url === "/api/skills/upload") {
-			const body = (await readBody(req)) as Record<string, unknown>;
-			const fileName = typeof body.fileName === "string" ? body.fileName : "";
-			const dataBase64 = typeof body.dataBase64 === "string" ? body.dataBase64 : "";
-			if (!fileName || !dataBase64) {
-				json(res, 400, { error: "Missing fileName or dataBase64" });
+		if (method === "POST" && url.split("?")[0] === "/api/skills/upload") {
+			const fileName = new URL(url, "http://localhost").searchParams.get("fileName")?.trim() || "";
+			if (!fileName) {
+				json(res, 400, { error: "Missing fileName" });
 				return;
 			}
-			const data = Buffer.from(dataBase64, "base64");
 			const ext = extname(fileName).toLowerCase();
-			const skill = ext === ".zip"
-				? installSkillZip(fileName, data)
-				: installSkillMarkdown(fileName, data);
-			setSkillEnabled(skill.name, true);
-			const installed = listProjectSkills().find((entry) => (entry as { name: string }).name === skill.name);
-			json(res, 201, installed ?? { name: skill.name });
-			scheduleSkillsReload();
+			if (ext !== ".zip" && ext !== ".md") {
+				json(res, 400, { error: "Only .zip or .md skill packages are supported" });
+				return;
+			}
+			const temporary = join(tmpdir(), `inno-global-skill-${randomUUID()}${ext}`);
+			try {
+				await streamRequestToFile(req, temporary, MAX_SKILL_UPLOAD_BYTES);
+				const data = readFileSync(temporary);
+				const skill = ext === ".zip"
+					? installSkillZip(fileName, data)
+					: installSkillMarkdown(fileName, data);
+				setSkillEnabled(skill.name, true);
+				const installed = listProjectSkills().find((entry) => (entry as { name: string }).name === skill.name);
+				json(res, 201, installed ?? { name: skill.name });
+				scheduleSkillsReload();
+			} finally {
+				rmSync(temporary, { force: true });
+			}
 			return;
 		}
 
@@ -3627,79 +3752,82 @@ const server = createServer(async (req, res) => {
 			return;
 		}
 
-		if (method === "POST" && url === "/api/workspace/upload") {
-			const body = (await readBody(req)) as Record<string, unknown>;
-			const wsId = workspaceIdFromBody(body);
+		if (method === "POST" && url.split("?")[0] === "/api/workspace/upload-file") {
+			const params = new URL(url, "http://localhost").searchParams;
+			const wsId = params.get("workspaceId")?.trim() || TEMP_WORKSPACE_ID;
 			const root = workspaceRegistry.resolveWorkspaceDir(wsId);
 			if (!root) { json(res, 404, { error: "Workspace not found" }); return; }
-			const files = Array.isArray(body.files) ? body.files : [];
-			if (!files.length) { json(res, 400, { error: "No files provided" }); return; }
-			const uploaded: Array<{ name: string; path: string; type: string; size: number; updatedAt: string }> = [];
-			let installedSkill = false;
-			for (const entry of files) {
-				const filePath = typeof entry.path === "string" ? entry.path.trim() : "";
-				const dataBase64 = typeof entry.dataBase64 === "string" ? entry.dataBase64 : "";
-				if (!filePath || !dataBase64) continue;
-				const fullPath = safeWorkspacePath(wsId, filePath);
-				if (!fullPath) continue;
-				const data = Buffer.from(dataBase64, "base64");
-				const ext = extname(filePath).toLowerCase();
-
-				// A .zip or .md dropped into the workspace's private skills dir is
-				// installed as a skill (zip is extracted) rather than written raw.
-				if (filePath.split("/").includes(WORKSPACE_PRIVATE_SKILLS_DIR) && (ext === ".zip" || ext === ".md")) {
-					try {
-						const skill = ext === ".zip"
-							? installSkillZip(basename(filePath), data, join(root, WORKSPACE_PRIVATE_SKILLS_DIR))
-							: installSkillMarkdown(basename(filePath), data, join(root, WORKSPACE_PRIVATE_SKILLS_DIR));
-						uploaded.push(workspaceSkillNode(root, skill.name));
-						installedSkill = true;
-						continue;
-					} catch (err) {
-						logger.error({ err }, "failed to install skill package during upload");
-						json(res, 400, { error: err instanceof Error ? err.message : "Failed to install skill package" });
-						return;
-					}
+			const conversationId = params.get("conversationId")?.trim() || "";
+			const filePath = params.get("path")?.trim() || "";
+			if (!filePath) { json(res, 400, { error: "Missing upload path" }); return; }
+			const dataAnalysisWorkspace = isDataAnalysisWorkspacePath(root);
+			let conversationInputDir: string | null = null;
+			if (dataAnalysisWorkspace) {
+				if (!conversationId) {
+					json(res, 400, { error: "Data-analysis uploads require a conversationId" });
+					return;
 				}
-
-				ensureDir(dirname(fullPath));
-				writeFileSync(fullPath, data);
-				const stat = statSync(fullPath);
-				uploaded.push({
-					name: basename(fullPath),
-					path: workspaceRelativePath(root, fullPath),
-					type: "file",
-					size: stat.size,
-					updatedAt: stat.mtime.toISOString(),
-				});
+				if (workspaceRegistry.getSessionWorkspaceId(conversationId) !== wsId) {
+					json(res, 403, { error: "Conversation is not bound to this workspace" });
+					return;
+				}
+				conversationInputDir = resolveDataAnalysisConversationPaths(root, conversationId).inputsDir;
+				ensureDir(conversationInputDir);
 			}
-			if (installedSkill) scheduleSkillsReload();
-			json(res, 201, { uploaded });
+			const requestedFullPath = conversationInputDir
+				? join(conversationInputDir, safeUploadedFileName(filePath))
+				: safeWorkspacePath(wsId, filePath);
+			if (!requestedFullPath) { json(res, 400, { error: "Invalid upload path" }); return; }
+			const ext = extname(filePath).toLowerCase();
+			const isSkill = filePath.replace(/\\/g, "/").split("/").includes(WORKSPACE_PRIVATE_SKILLS_DIR)
+				&& (ext === ".zip" || ext === ".md");
+			const maxBytes = uploadLimitForPath(filePath);
+
+			if (isSkill) {
+				const temporary = join(tmpdir(), `inno-skill-upload-${randomUUID()}${ext}`);
+				try {
+					await streamRequestToFile(req, temporary, maxBytes);
+					const data = readFileSync(temporary);
+					const skill = ext === ".zip"
+						? installSkillZip(basename(filePath), data, join(root, WORKSPACE_PRIVATE_SKILLS_DIR))
+						: installSkillMarkdown(basename(filePath), data, join(root, WORKSPACE_PRIVATE_SKILLS_DIR));
+					scheduleSkillsReload();
+					json(res, 201, { uploaded: [workspaceSkillNode(root, skill.name)] });
+				} finally {
+					rmSync(temporary, { force: true });
+				}
+				return;
+			}
+
+			ensureDir(dirname(requestedFullPath));
+			const fullPath = versionedUploadPath(requestedFullPath);
+			const temporary = `${fullPath}.upload-${randomUUID()}.tmp`;
+			try {
+				await streamRequestToFile(req, temporary, maxBytes);
+				renameSync(temporary, fullPath);
+			} catch (err) {
+				rmSync(temporary, { force: true });
+				throw err;
+			}
+			const stat = statSync(fullPath);
+			json(res, 201, { uploaded: [{
+				name: basename(fullPath),
+				path: workspaceRelativePath(root, fullPath),
+				type: "file",
+				size: stat.size,
+				updatedAt: stat.mtime.toISOString(),
+			}] });
+			return;
+		}
+
+		if (method === "POST" && url === "/api/workspace/upload") {
+			json(res, 410, { error: "Base64 workspace uploads are disabled; use /api/workspace/upload-file" });
 			return;
 		}
 
 		// Install a skill package (.zip / .md) into the workspace's private .skills dir.
 		if (method === "POST" && url === "/api/workspace/skills/upload") {
-			const body = (await readBody(req)) as Record<string, unknown>;
-			const wsId = workspaceIdFromBody(body);
-			const root = workspaceRegistry.resolveWorkspaceDir(wsId);
-			if (!root) { json(res, 404, { error: "Workspace not found" }); return; }
-			const fileName = typeof body.fileName === "string" ? body.fileName : "";
-			const dataBase64 = typeof body.dataBase64 === "string" ? body.dataBase64 : "";
-			if (!fileName || !dataBase64) { json(res, 400, { error: "Missing fileName or dataBase64" }); return; }
-			const ext = extname(fileName).toLowerCase();
-			if (ext !== ".zip" && ext !== ".md") { json(res, 400, { error: "Only .zip or .md skill packages are supported" }); return; }
-			const data = Buffer.from(dataBase64, "base64");
-			try {
-				const skill = ext === ".zip"
-					? installSkillZip(fileName, data, join(root, WORKSPACE_PRIVATE_SKILLS_DIR))
-					: installSkillMarkdown(fileName, data, join(root, WORKSPACE_PRIVATE_SKILLS_DIR));
-				scheduleSkillsReload();
-				json(res, 201, workspaceSkillNode(root, skill.name));
-			} catch (err) {
-				logger.error({ err }, "failed to install workspace skill package");
-				json(res, 400, { error: err instanceof Error ? err.message : "Failed to install skill package" });
-			}
+			json(res, 410, { error: "Base64 skill uploads are disabled; use /api/workspace/upload-file" });
 			return;
 		}
 
@@ -3932,13 +4060,12 @@ const server = createServer(async (req, res) => {
 
 
 		// --- L2 Raw Upload API ---
-		if (method === "POST" && url === "/api/l2/raw/upload") {
-			const body = (await readBody(req)) as Record<string, unknown>;
-			const fileName = typeof body.fileName === "string" ? body.fileName : "";
-			const mimeType = typeof body.mimeType === "string" ? body.mimeType : "application/octet-stream";
-			const dataBase64 = typeof body.dataBase64 === "string" ? body.dataBase64 : "";
-			if (!fileName || !dataBase64) {
-				json(res, 400, { error: "Missing fileName or dataBase64" });
+		if (method === "POST" && url.split("?")[0] === "/api/l2/raw/upload") {
+			const params = new URL(url, "http://localhost").searchParams;
+			const fileName = params.get("fileName")?.trim() || "";
+			const mimeType = String(req.headers["content-type"] || "application/octet-stream").split(";")[0];
+			if (!fileName) {
+				json(res, 400, { error: "Missing fileName" });
 				return;
 			}
 
@@ -3949,14 +4076,21 @@ const server = createServer(async (req, res) => {
 			const ext = uploadExtension(safeName, mimeType);
 			const base = basename(safeName, ext).slice(0, 80) || "upload";
 			const outputName = `${timestamp}-${base}${ext}`;
-			const outputPath = join(dir, outputName);
-			const data = Buffer.from(dataBase64, "base64");
-			writeFileSync(outputPath, data);
-			const rawPath = join("raw", "uploads", outputName);
+			const outputPath = versionedUploadPath(join(dir, outputName));
+			const temporary = `${outputPath}.upload-${randomUUID()}.tmp`;
+			let size: number;
+			try {
+				size = await streamRequestToFile(req, temporary, uploadLimitForPath(safeName));
+				renameSync(temporary, outputPath);
+			} catch (err) {
+				rmSync(temporary, { force: true });
+				throw err;
+			}
+			const rawPath = join("raw", "uploads", basename(outputPath));
 			json(res, 201, {
 				fileName,
 				mimeType,
-				size: data.length,
+				size,
 				rawPath,
 			});
 			return;
@@ -4552,7 +4686,11 @@ const server = createServer(async (req, res) => {
 		json(res, 404, { error: "Not found" });
 	} catch (err) {
 		logger.error({ err }, "unhandled error in HTTP handler");
-		json(res, 500, { error: "Internal server error" });
+		if (err instanceof RequestTooLargeError) {
+			json(res, 413, { error: err.message, maxBytes: err.maxBytes });
+		} else {
+			json(res, 500, { error: "Internal server error" });
+		}
 	}
 });
 

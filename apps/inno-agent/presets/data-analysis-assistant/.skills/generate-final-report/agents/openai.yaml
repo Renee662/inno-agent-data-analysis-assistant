@@ -1,0 +1,4 @@
+interface:
+  display_name: "生成最终分析报告"
+  short_description: "Build a polished auditable HTML analysis report"
+  default_prompt: "Use $generate-final-report to package approved analysis artifacts into a polished local outputs/final-report.html with reproducibility files."

@@ -1,5 +1,5 @@
 import { EventEmitter } from "./event-emitter.js";
-import { streamChat, abortChat, streamSessionEvents } from "../api/chat.js";
+import { streamChat, abortChat, streamSessionEvents, answerQuestion } from "../api/chat.js";
 import type { InlineImage } from "../api/chat.js";
 import type { ChatMessage, ChatStreamEvent, ChatToolRecord, PendingQuestion, QuestionnaireResult, WorkspaceFileChange } from "../types/chat.js";
 import { notebookStore } from "./notebook-store.js";
@@ -491,16 +491,10 @@ class ChatStoreImpl extends EventEmitter<ChatStoreEvents> {
 	}
 
 	async submitQuestionResponse(questionId: string, result: QuestionnaireResult): Promise<void> {
-		this.pendingQuestion = null;
-		this.emit("change", undefined);
-		try {
-			await fetch("/api/chat/question-response", {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ questionId, result }),
-			});
-		} catch {
-			// best-effort — the agent will time out or get cancelled if this fails
+		await answerQuestion(questionId, result);
+		if (this.pendingQuestion?.questionId === questionId) {
+			this.pendingQuestion = null;
+			this.emit("change", undefined);
 		}
 	}
 

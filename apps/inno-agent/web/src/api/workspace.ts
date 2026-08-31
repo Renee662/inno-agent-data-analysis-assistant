@@ -1,5 +1,6 @@
-import { apiFetch } from "./client.js";
+import { ApiError, apiFetch } from "./client.js";
 import type { PptxPreviewResult, WorkspaceFileDetail, WorkspaceTree, WorkspaceTreeNode } from "../types/workspace.js";
+import { assertFileWithinUploadLimit } from "./upload-limits.js";
 
 function qs(workspaceId?: string): string {
 	return workspaceId ? `?workspaceId=${encodeURIComponent(workspaceId)}` : "";
@@ -55,19 +56,37 @@ export async function saveWorkspaceFile(path: string, content: string, workspace
 	});
 }
 
-export async function uploadWorkspaceFiles(files: Array<{ path: string; dataBase64: string }>, workspaceId?: string): Promise<{ uploaded: WorkspaceTreeNode[] }> {
-	return apiFetch<{ uploaded: WorkspaceTreeNode[] }>("/api/workspace/upload", {
-		method: "POST",
-		body: JSON.stringify(withWorkspace({ files }, workspaceId)),
-	});
+export async function uploadWorkspaceFiles(
+	files: Array<{ path: string; file: File }>,
+	workspaceId?: string,
+	conversationId?: string,
+): Promise<{ uploaded: WorkspaceTreeNode[] }> {
+	const uploaded: WorkspaceTreeNode[] = [];
+	for (const item of files) {
+		assertFileWithinUploadLimit(item.file);
+		const params = new URLSearchParams({ path: item.path });
+		if (workspaceId) params.set("workspaceId", workspaceId);
+		if (conversationId) params.set("conversationId", conversationId);
+		const response = await fetch(`/api/workspace/upload-file?${params.toString()}`, {
+			method: "POST",
+			headers: { "Content-Type": item.file.type || "application/octet-stream" },
+			body: item.file,
+		});
+		if (!response.ok) {
+			const body = await response.json().catch(() => ({}));
+			throw new ApiError(response.status, (body as Record<string, string>).error || response.statusText);
+		}
+		const result = await response.json() as { uploaded?: WorkspaceTreeNode[] };
+		uploaded.push(...(result.uploaded ?? []));
+	}
+	return { uploaded };
 }
 
 /** Install a skill package (.zip / .md) into the workspace's private `.skills` dir. */
-export async function uploadWorkspaceSkill(fileName: string, dataBase64: string, workspaceId?: string): Promise<WorkspaceTreeNode> {
-	return apiFetch<WorkspaceTreeNode>("/api/workspace/skills/upload", {
-		method: "POST",
-		body: JSON.stringify(withWorkspace({ fileName, dataBase64 }, workspaceId)),
-	});
+export async function uploadWorkspaceSkill(file: File, workspaceId?: string): Promise<WorkspaceTreeNode> {
+	const result = await uploadWorkspaceFiles([{ path: `.skills/${file.name}`, file }], workspaceId);
+	if (!result.uploaded[0]) throw new Error("Skill upload completed without an installed skill");
+	return result.uploaded[0];
 }
 
 /** Build the raw URL for a workspace file, optionally forcing a download. */

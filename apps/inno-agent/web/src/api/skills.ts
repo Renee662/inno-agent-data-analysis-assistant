@@ -1,4 +1,5 @@
-import { apiFetch } from "./client.js";
+import { ApiError, apiFetch } from "./client.js";
+import { assertFileWithinUploadLimit } from "./upload-limits.js";
 import type { SkillInfo, SkillLibraryItem } from "../types/skills.js";
 import type { WorkspaceTreeNode, WorkspaceFileDetail } from "../types/workspace.js";
 
@@ -18,24 +19,17 @@ export async function importSkillFromLibrary(name: string): Promise<SkillInfo> {
 }
 
 export async function uploadSkill(file: File): Promise<SkillInfo> {
-	const dataBase64 = await new Promise<string>((resolve, reject) => {
-		const reader = new FileReader();
-		reader.onload = () => {
-			const result = String(reader.result ?? "");
-			resolve(result.includes(",") ? result.split(",")[1] : result);
-		};
-		reader.onerror = () => reject(reader.error ?? new Error("Failed to read file"));
-		reader.readAsDataURL(file);
-	});
-
-	return apiFetch<SkillInfo>("/api/skills/upload", {
+	assertFileWithinUploadLimit(file);
+	const response = await fetch(`/api/skills/upload?fileName=${encodeURIComponent(file.name)}`, {
 		method: "POST",
-		body: JSON.stringify({
-			fileName: file.name,
-			mimeType: file.type || "text/markdown",
-			dataBase64,
-		}),
+		headers: { "Content-Type": file.type || "application/octet-stream" },
+		body: file,
 	});
+	if (!response.ok) {
+		const body = await response.json().catch(() => ({}));
+		throw new ApiError(response.status, (body as Record<string, string>).error || response.statusText);
+	}
+	return response.json() as Promise<SkillInfo>;
 }
 
 export async function updateSkill(name: string, enabled: boolean): Promise<SkillInfo> {

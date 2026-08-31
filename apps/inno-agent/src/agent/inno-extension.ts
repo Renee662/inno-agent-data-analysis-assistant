@@ -1,5 +1,6 @@
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { isAbsolute, join, relative } from "node:path";
 import {
 	formatSkillsForPrompt,
 	loadSkillsFromDir,
@@ -19,10 +20,43 @@ import { L3Memory, createL3Tools, formatRecallForPrompt } from "../memory/l3/l3-
 import { createPracticeTools } from "./practice-tools.js";
 import { createDocumentTools } from "./document-tools.js";
 import { createOcrTools } from "./ocr-tools.js";
+import { sanitizeMessagesForTextOnly } from "./image-input-compat.js";
+import {
+	formatDataAnalysisEnvironmentPrompt,
+	inspectDataAnalysisEnvironment,
+	rewriteDataAnalysisPythonCommand,
+	type DataAnalysisEnvironmentStatus,
+	usesWorkspaceLocalPython,
+} from "./data-analysis-python-env.js";
+import {
+	DATA_ANALYSIS_INSTALL_APPROVAL,
+	DATA_ANALYSIS_RUNTIME_PROMPT,
+	DATA_ANALYSIS_SETUP_TIMEOUT_SECONDS,
+	attemptsDataAnalysisScriptAuthoring,
+	classifyDataAnalysisToolCall,
+	formatDataAnalysisConversationPrompt,
+	formatDataAnalysisRuntimeLimits,
+	hasDataAnalysisInstallApproval,
+	isAllowlistedDependencySetupCommand,
+	isDataAnalysisWorkspacePath,
+	isDependencySetupCommand,
+	isDataAnalysisScriptPath,
+	resolveDataAnalysisConversationPaths,
+	resolveDataAnalysisRuntimeLimits,
+	type DataAnalysisConversationPaths,
+	type DataAnalysisRuntimeLimits,
+	type DataAnalysisToolBudgetBucket,
+	writesDataAnalysisLegacyRoot,
+} from "./data-analysis-runtime-policy.js";
 import { checkWorkspaceMutationPath } from "./workspace-path-guard.js";
 import { INNO_SYSTEM_PROMPT, ONBOARDING_GUIDE } from "./system-prompt.js";
 import { syncProvidersForSubagents } from "./provider-sync.js";
 import { questionBridge } from "./question-bridge.js";
+import { recordQuestionApprovals } from "./approval-record.js";
+import {
+	prepareQuestionnairePresentation,
+	type InnoQuestionnaireParams,
+} from "./question-presentation.js";
 import { logger } from "../logger.js";
 import type { ChannelRegistry } from "../channels/channel.js";
 import type { ChannelName } from "../channels/types.js";
@@ -150,6 +184,26 @@ export function createInnoExtension(
 	deps?: InnoExtensionDeps,
 ): ExtensionFactory {
 	return async (pi: ExtensionAPI) => {
+		let dataAnalysisToolCallCounts: Record<DataAnalysisToolBudgetBucket, number> = {
+			inspection: 0,
+			execution: 0,
+			delivery: 0,
+		};
+		let dataAnalysisInstallApproved = false;
+		let dataAnalysisEnvironmentStatus: DataAnalysisEnvironmentStatus | undefined;
+		let dataAnalysisConversationPaths: DataAnalysisConversationPaths | undefined;
+		let dataAnalysisRuntimeLimits: DataAnalysisRuntimeLimits | undefined;
+		const resetDataAnalysisStageBudget = () => {
+			dataAnalysisToolCallCounts = { inspection: 0, execution: 0, delivery: 0 };
+			const workspaceDir = resolveActiveWorkspaceDir(paths, deps);
+			if (isDataAnalysisWorkspacePath(workspaceDir)) {
+				dataAnalysisRuntimeLimits = resolveDataAnalysisRuntimeLimits(
+					workspaceDir,
+					dataAnalysisConversationPaths?.absoluteDir,
+				);
+			}
+		};
+
 		// 1. Register configured backend model providers.
 		const config = configHolder.current;
 		for (const [providerId, providerConfig] of Object.entries(config.providers)) {
@@ -182,6 +236,58 @@ export function createInnoExtension(
 			} catch (err) {
 				// The selected model may be a runtime-only model; leave persisted config unchanged.
 				logger.warn({ err, provider: event.model.provider, modelId: event.model.id }, "model_select: failed to persist default model to config");
+			}
+		});
+
+		// PI keeps tool-returned images in the session so the web UI can display
+		// them. Before each provider call, remove those image blocks only from
+		// the transient request context when the selected model is text-only.
+		// This prevents OpenAI-compatible text endpoints such as DeepSeek from
+		// rejecting a later turn with "unknown variant image_url".
+		pi.on("context", async (event, ctx) => {
+			if (!ctx.model || ctx.model.input.includes("image")) return undefined;
+
+			const result = sanitizeMessagesForTextOnly(event.messages);
+			if (result.removedImageCount === 0) return undefined;
+
+			logger.info(
+				{
+					provider: ctx.model.provider,
+					modelId: ctx.model.id,
+					removedImageCount: result.removedImageCount,
+				},
+				"removed image blocks from text-only model request context",
+			);
+			return { messages: result.messages };
+		});
+
+		// Reset at the start of a user turn. Completed questionnaires also reset
+		// the counters so each confirmed stage receives its own budget.
+		pi.on("before_agent_start", async (event) => {
+			dataAnalysisToolCallCounts = { inspection: 0, execution: 0, delivery: 0 };
+			dataAnalysisInstallApproved = hasDataAnalysisInstallApproval(event.prompt);
+			const workspaceDir = resolveActiveWorkspaceDir(paths, deps);
+			if (isDataAnalysisWorkspacePath(workspaceDir)) {
+				const sessionId = deps?.getCurrentSessionId?.() ?? "";
+				dataAnalysisConversationPaths = resolveDataAnalysisConversationPaths(
+					workspaceDir,
+					sessionId,
+				);
+				mkdirSync(dataAnalysisConversationPaths.absoluteDir, { recursive: true });
+				dataAnalysisEnvironmentStatus = inspectDataAnalysisEnvironment(paths);
+				dataAnalysisRuntimeLimits = resolveDataAnalysisRuntimeLimits(
+					workspaceDir,
+					dataAnalysisConversationPaths.absoluteDir,
+				);
+				process.env.INNO_DATA_ANALYSIS_PYTHON = dataAnalysisEnvironmentStatus.pythonPath;
+				process.env.INNO_CONVERSATION_DIR = dataAnalysisConversationPaths.absoluteDir;
+				process.env.INNO_CONVERSATION_REL_DIR = dataAnalysisConversationPaths.relativeDir;
+			} else {
+				dataAnalysisEnvironmentStatus = undefined;
+				dataAnalysisConversationPaths = undefined;
+				dataAnalysisRuntimeLimits = undefined;
+				delete process.env.INNO_CONVERSATION_DIR;
+				delete process.env.INNO_CONVERSATION_REL_DIR;
 			}
 		});
 
@@ -303,6 +409,140 @@ export function createInnoExtension(
 			};
 		});
 
+		// Data-analysis workspaces are deliberately bounded: one user-confirmed
+		// stage should finish quickly with the bundled scripts, not create an
+		// open-ended coding session or install packages without consent.
+		pi.on("tool_call", async (event) => {
+			const workspaceDir = resolveActiveWorkspaceDir(paths, deps);
+			if (!isDataAnalysisWorkspacePath(workspaceDir)) return undefined;
+
+			// Profiling may have been generated earlier in the same stage. Resolve
+			// from disk for every call so the real row/column tier takes effect.
+			const runtimeLimits = resolveDataAnalysisRuntimeLimits(
+				workspaceDir,
+				dataAnalysisConversationPaths?.absoluteDir,
+			);
+			dataAnalysisRuntimeLimits = runtimeLimits;
+			const budgetBucket = classifyDataAnalysisToolCall(event.toolName, event.input);
+			if (budgetBucket !== "unmetered") {
+				dataAnalysisToolCallCounts[budgetBucket] += 1;
+				const allowed = runtimeLimits.toolBudgets[budgetBucket];
+				if (dataAnalysisToolCallCounts[budgetBucket] > allowed) {
+					const labels: Record<DataAnalysisToolBudgetBucket, string> = {
+						inspection: "检查与读取",
+						execution: "执行与写入",
+						delivery: "最终交付",
+					};
+					return {
+						block: true,
+						reason: `当前阶段“${labels[budgetBucket]}”工具额度已用完（${allowed} 次）。其他类别的保留额度不能挪用；请停止该阶段，简要汇报已完成内容、未完成原因和下一步。`,
+					};
+				}
+			}
+
+			if (
+				(event.toolName === "write" || event.toolName === "edit") &&
+				typeof event.input?.path === "string" &&
+				isDataAnalysisScriptPath(event.input.path)
+			) {
+				return {
+					block: true,
+					reason: "当前数据分析预设不允许在对话中编写或修改扩展脚本。只能运行 .skills/ 中已经提供并验证的脚本；能力不匹配时请停止并说明需要的专门工作流。",
+				};
+			}
+
+			if (event.toolName === "write" || event.toolName === "edit") {
+				const requestedPath = event.input?.path;
+				const conversation =
+					dataAnalysisConversationPaths ??
+					resolveDataAnalysisConversationPaths(
+						workspaceDir,
+						deps?.getCurrentSessionId?.() ?? "",
+					);
+				if (typeof requestedPath !== "string") {
+					return { block: true, reason: "文件路径无效。" };
+				}
+				const workspaceCheck = checkWorkspaceMutationPath(workspaceDir, requestedPath);
+				if (!workspaceCheck.allowed) return undefined;
+				if (!workspaceCheck.resolvedPath) {
+					return { block: true, reason: "无法解析文件路径，请改用本次对话目录内的相对路径。" };
+				}
+				const within = relative(conversation.absoluteDir, workspaceCheck.resolvedPath);
+				if (!within.startsWith("..") && !isAbsolute(within)) return undefined;
+				return {
+					block: true,
+					reason: `本次对话生成的文件必须写入 ${conversation.relativeDir}。请把中间文件放入该目录下的 work/，最终交付物放入 outputs/。`,
+				};
+			}
+
+			if (event.toolName !== "bash") return undefined;
+			const rawCommand = event.input?.command;
+			if (typeof rawCommand !== "string") return undefined;
+			let command: string = rawCommand;
+			if (attemptsDataAnalysisScriptAuthoring(command)) {
+				return {
+					block: true,
+					reason: "当前数据分析预设不允许通过命令临时编写扩展脚本或执行内联代码。请使用 .skills/ 中的既有脚本；若不支持本次任务，停止并说明所需专门工作流。",
+				};
+			}
+			if (writesDataAnalysisLegacyRoot(command)) {
+				const conversation =
+					dataAnalysisConversationPaths ??
+					resolveDataAnalysisConversationPaths(
+						workspaceDir,
+						deps?.getCurrentSessionId?.() ?? "",
+					);
+				return {
+					block: true,
+					reason: `旧命令会把产物写到工作区根目录。请把 --output-dir 改到 $env:INNO_CONVERSATION_DIR 下；本次对话目录是 ${conversation.relativeDir}。`,
+				};
+			}
+
+			const environmentStatus =
+				dataAnalysisEnvironmentStatus ?? inspectDataAnalysisEnvironment(paths);
+			if (usesWorkspaceLocalPython(command)) {
+				if (!environmentStatus.ready) {
+					return {
+						block: true,
+						reason: `共享数据分析基础环境尚未准备好。不要创建或使用工作区 .venv；请说明一次性安装的网络与时间成本，并要求用户明确回复“${DATA_ANALYSIS_INSTALL_APPROVAL}”。`,
+					};
+				}
+				command = rewriteDataAnalysisPythonCommand(command, environmentStatus.pythonPath);
+				event.input.command = command;
+			}
+			const dependencySetup = isDependencySetupCommand(command, environmentStatus.setupScriptPath);
+			if (dependencySetup && !dataAnalysisInstallApproved) {
+				return {
+					block: true,
+					reason: `不得自动创建虚拟环境或安装依赖。共享基础环境只需准备一次；请先说明所需包、用途、预计耗时和网络下载风险，并要求用户明确回复“${DATA_ANALYSIS_INSTALL_APPROVAL}”。`,
+				};
+			}
+			if (
+				dependencySetup &&
+				!isAllowlistedDependencySetupCommand(command, environmentStatus.setupScriptPath)
+			) {
+				return {
+					block: true,
+					reason: `依赖命令不在允许范围内。批准后只能运行共享环境准备脚本：node "${environmentStatus.setupScriptPath}"；不得直接运行 pip/conda、创建工作区 .venv、安装任意包或使用额外软件源。`,
+				};
+			}
+
+			const maxTimeout = dependencySetup
+				? DATA_ANALYSIS_SETUP_TIMEOUT_SECONDS
+				: (dataAnalysisRuntimeLimits ??
+						resolveDataAnalysisRuntimeLimits(
+							workspaceDir,
+							dataAnalysisConversationPaths?.absoluteDir,
+						))
+					.commandTimeoutSeconds;
+			const requestedTimeout = event.input.timeout;
+			event.input.timeout =
+				typeof requestedTimeout === "number" && requestedTimeout > 0
+					? Math.min(requestedTimeout, maxTimeout)
+					: maxTimeout;
+			return undefined;
+		});
+
 		// 5b. Block `open`/`xdg-open` shell commands. In server deployments
 		// these run on the host where the user can't see the result; the web
 		// file panel already auto-opens a preview when files are written.
@@ -361,6 +601,23 @@ export function createInnoExtension(
 				const workspaceDir = resolveActiveWorkspaceDir(paths, deps);
 				sections.push(formatWorkspaceFileInstructions(workspaceDir));
 				sections.push(...buildWorkspaceContextSections(workspaceDir));
+				if (isDataAnalysisWorkspacePath(workspaceDir)) {
+					sections.push(DATA_ANALYSIS_RUNTIME_PROMPT);
+					const conversation =
+						dataAnalysisConversationPaths ??
+						resolveDataAnalysisConversationPaths(
+							workspaceDir,
+							deps?.getCurrentSessionId?.() ?? "",
+						);
+					sections.push(formatDataAnalysisConversationPrompt(conversation));
+					const runtimeLimits =
+						dataAnalysisRuntimeLimits ??
+						resolveDataAnalysisRuntimeLimits(workspaceDir, conversation.absoluteDir);
+					sections.push(formatDataAnalysisRuntimeLimits(runtimeLimits));
+					const environmentStatus =
+						dataAnalysisEnvironmentStatus ?? inspectDataAnalysisEnvironment(paths);
+					sections.push(formatDataAnalysisEnvironmentPrompt(environmentStatus));
+				}
 
 				// Inject threshold-gated cross-conversation recall (L3). Only
 				// injects when past snippets clear the relevance threshold, so
@@ -488,7 +745,93 @@ export function createInnoExtension(
 			const envelopeModule = await jiti2.import(envelopePath) as Record<string, unknown>;
 			const validateModule = await jiti2.import(validatePath) as Record<string, unknown>;
 
-			const QuestionParamsSchema = typesModule.QuestionParamsSchema as Record<string, unknown>;
+			const baseQuestionParamsSchema = typesModule.QuestionParamsSchema as any;
+			const baseQuestionSchema = baseQuestionParamsSchema?.properties?.questions?.items;
+			const baseOptionSchema = baseQuestionSchema?.properties?.options?.items;
+			if (!baseQuestionSchema?.properties) {
+				throw new Error("ask_user_question schema is missing the question item definition");
+			}
+			const QuestionParamsSchema = {
+				...baseQuestionParamsSchema,
+				properties: {
+					...baseQuestionParamsSchema.properties,
+					questions: {
+						...baseQuestionParamsSchema.properties.questions,
+						items: {
+							...baseQuestionSchema,
+							properties: {
+								...baseQuestionSchema.properties,
+								options: baseOptionSchema?.properties
+									? {
+										...baseQuestionSchema.properties.options,
+										items: {
+											...baseOptionSchema,
+											properties: {
+												...baseOptionSchema.properties,
+												approvalDecision: {
+													type: "string",
+													enum: ["approve", "revise", "reject", "help"],
+													description: "Explicit decision semantics. Exactly one option may be marked approve for an approval question.",
+												},
+											},
+										},
+									}
+									: baseQuestionSchema.properties.options,
+								questionKind: {
+									type: "string",
+									enum: ["decision", "task-card", "observation"],
+									description:
+										"Presentation contract. Task-card questions must display the current analysis task card; observation questions must display the referenced plot.",
+								},
+								approvalAction: {
+										type: "string",
+										enum: [
+											"approve-analysis-task",
+											"approve-workflow-support",
+											"approve-model-specification",
+											"approve-final-report",
+									],
+									description: "Approval action recorded by the server after the user selects the approve option.",
+								},
+								approvalArtifactPath: {
+									type: "string",
+									description: "Workspace-relative JSON or Markdown proposal whose exact SHA-256 is bound to the approval receipt.",
+								},
+								documentPath: {
+									type: "string",
+									description:
+										"Workspace-relative JSON or Markdown document displayed as a compact card inside the questionnaire.",
+								},
+								documentTitle: {
+									type: "string",
+									maxLength: 120,
+								},
+								documentCaption: {
+									type: "string",
+									maxLength: 240,
+								},
+								imagePath: {
+									type: "string",
+									description:
+										"Optional path to one workspace-local image that the web questionnaire should show above this question. Use a path relative to the active workspace, never an external URL or base64 data.",
+								},
+								imageAlt: {
+									type: "string",
+									maxLength: 120,
+									description:
+										"Optional concise alternative text describing the question image.",
+								},
+								imageCaption: {
+									type: "string",
+									maxLength: 240,
+									description:
+										"Optional short caption explaining what the user should inspect in the question image.",
+								},
+							},
+						},
+					},
+				},
+			} as Record<string, unknown>;
 			const buildQuestionnaireResponse = envelopeModule.buildQuestionnaireResponse as (result: unknown, params: unknown) => { content: Array<{ type: string; text: string }>; details: unknown };
 			const buildToolResult = envelopeModule.buildToolResult as (text: string, details: unknown) => { content: Array<{ type: string; text: string }>; details: unknown };
 			const validateQuestionnaire = validateModule.validateQuestionnaire as (params: unknown) => { ok: boolean; error?: string; message?: string };
@@ -512,10 +855,10 @@ export function createInnoExtension(
 			pi.registerTool({
 				name: "ask_user_question",
 				label: "Ask User Question",
-				description: "Ask the user one or more questions with predefined options. Supports single-select, multi-select, free text input, and option previews.",
+				description: "Ask the user one or more questions with predefined options. Analysis task-card confirmation is rendered with its current JSON/Markdown card, and any observation question is rejected unless it carries the workspace-local image the user must inspect.",
 				parameters: QuestionParamsSchema,
 				async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-					const typed = params as { questions: Array<{ question: string; header: string; options: Array<{ label: string; description: string; preview?: string }>; multiSelect?: boolean }> };
+					const typed = params as InnoQuestionnaireParams;
 
 					const validation = validateQuestionnaire(typed);
 					if (!validation.ok) {
@@ -526,11 +869,35 @@ export function createInnoExtension(
 						});
 					}
 
+					const workspaceDir = resolveActiveWorkspaceDir(paths, deps);
+					const prepared = isDataAnalysisWorkspacePath(workspaceDir)
+						? prepareQuestionnairePresentation(
+							typed,
+							workspaceDir,
+							dataAnalysisConversationPaths
+								? join(
+									dataAnalysisConversationPaths.relativeDir,
+									"work",
+									"analysis-plan",
+									"analysis-task.json",
+								)
+								: undefined,
+						)
+						: { ok: true, params: typed };
+					if (!prepared.ok || !prepared.params) {
+						return buildToolResult(prepared.error ?? "Question presentation requirements were not met", {
+							answers: [],
+							cancelled: true,
+							error: prepared.error,
+						});
+					}
+					const presented = prepared.params;
+
 					// TUI mode: delegate to rpiv's QuestionnaireSession
 					if (ctx.hasUI) {
 						await ensureTuiModules();
 						const buildItems = buildItemsForQuestion as (q: unknown) => unknown[];
-						const itemsByTab = typed.questions.map((q) => buildItems(q));
+						const itemsByTab = presented.questions.map((q) => buildItems(q));
 						const ui = ctx.ui as { custom: <T>(fn: (tui: unknown, theme: unknown, kb: unknown, done: (r: T) => void) => unknown) => Promise<T> };
 						const SessionClass = QuestionnaireSession as new (config: unknown) => { component: unknown };
 
@@ -538,18 +905,44 @@ export function createInnoExtension(
 							const session = new SessionClass({
 								tui,
 								theme,
-								params: typed,
+								params: presented,
 								itemsByTab,
 								done,
 							});
 							return session.component;
 						});
-						return buildQuestionnaireResponse(result, typed);
+						const recorded = recordQuestionApprovals(
+							presented,
+							result as import("./question-bridge.js").QuestionBridgeResult,
+							{
+								workspaceDir,
+								sessionId: deps?.getCurrentSessionId?.() ?? "local-tui",
+								questionId: randomUUID(),
+								source: "tui-questionnaire",
+							},
+						);
+						if (!recorded.cancelled) {
+							resetDataAnalysisStageBudget();
+						}
+						if (recorded.error?.startsWith("approval_")) {
+							return buildToolResult(`Approval was not recorded: ${recorded.error}`, recorded);
+						}
+						return buildQuestionnaireResponse(recorded, presented);
 					}
 
 					// Web mode: delegate to QuestionBridge
-					const bridgeResult = await questionBridge.ask(typed);
-					return buildQuestionnaireResponse(bridgeResult, typed);
+					const bridgeResult = await questionBridge.ask(presented);
+					const recorded = recordQuestionApprovals(presented, bridgeResult, {
+						workspaceDir,
+						sessionId: deps?.getCurrentSessionId?.() ?? "web-session",
+						questionId: bridgeResult.questionId ?? randomUUID(),
+						source: "web-question-dialog",
+					});
+					if (!recorded.cancelled) resetDataAnalysisStageBudget();
+					if (recorded.error?.startsWith("approval_")) {
+						return buildToolResult(`Approval was not recorded: ${recorded.error}`, recorded);
+					}
+					return buildQuestionnaireResponse(recorded, presented);
 				},
 			} as Parameters<typeof pi.registerTool>[0]);
 		} catch (err) {

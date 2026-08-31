@@ -1,0 +1,4 @@
+interface:
+  display_name: "统计建模与诊断"
+  short_description: "Run an approved statistical model with diagnostics"
+  default_prompt: "Use $run-statistical-analysis to confirm a model specification, fit it to cleaned tabular data, and create auditable results and diagnostics."

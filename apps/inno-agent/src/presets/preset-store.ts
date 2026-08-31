@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import type { RuntimePaths } from "../runtime.js";
 import type { WorkspaceMeta, WorkspaceRegistry } from "../workspace/workspace-registry.js";
 import type { RemoteContentSource } from "../content-source/index.js";
@@ -10,7 +10,7 @@ import { logger } from "../logger.js";
  * Preset workspaces — ready-to-use templates surfaced in Simple Mode.
  *
  * Each preset is a directory containing:
- *   - `preset.json` — metadata `{ id, name, description, icon? }` (id must equal
+ *   - `preset.json` — metadata `{ id, name, description, version, icon? }` (id must equal
  *     the directory name)
  *   - `agent.md`    — per-workspace instructions (injected each turn by the
  *     extension's `before_agent_start` hook)
@@ -20,17 +20,21 @@ import { logger } from "../logger.js";
  * bundle service) and materialized into a local cache under
  * `<dataDir>/preset-cache/<id>/`. Opening a preset instantiates it: a fresh
  * editable workspace is created and the preset's `agent.md` + `.skills/` are
- * copied in (excluding `preset.json`). The cache is the single source of truth
- * for instantiation, so first open requires the network but later opens (and
- * offline use) reuse the cached copy.
+ * copied in (excluding `preset.json`). A newer bundled version refreshes stale
+ * cache and managed workspace files; conflicting local edits are backed up
+ * before replacement. Offline use continues to reuse the latest cached copy.
  */
 
 export interface PresetMeta {
 	id: string;
 	name: string;
 	description: string;
+	/** Monotonically increasing bundled-content version used for safe upgrades. */
+	version: number;
 	icon?: string;
 	category?: string;
+	/** Optional zero-cost greeting rendered by the web UI for an empty preset session. */
+	welcomeMessage?: string;
 }
 
 /** Only simple, single-segment ids — blocks path traversal. */
@@ -72,8 +76,12 @@ function parsePresetMeta(rawText: string, id: string): PresetMeta | null {
 			id,
 			name,
 			description: (raw.description ?? "").trim(),
+			version: Number.isInteger(raw.version) && Number(raw.version) > 0
+				? Number(raw.version)
+				: 1,
 			icon: raw.icon?.trim() || undefined,
 			category: raw.category?.trim() || undefined,
+			welcomeMessage: raw.welcomeMessage?.trim() || undefined,
 		};
 	} catch (err) {
 		logger.warn({ err, id }, "failed to parse preset.json; skipping");
@@ -102,7 +110,10 @@ export function listPresets(paths: RuntimePaths): PresetMeta[] {
 			if (entry.name === "__MACOSX" || entry.name.startsWith(".") || entry.name.startsWith("_")) continue;
 			if (!isValidPresetId(entry.name)) continue;
 			const meta = readPresetMeta(join(root, entry.name), entry.name);
-			if (meta) byId.set(meta.id, meta);
+			if (meta) {
+				const current = byId.get(meta.id);
+				if (!current || meta.version >= current.version) byId.set(meta.id, meta);
+			}
 		}
 	}
 	return Array.from(byId.values()).sort((a, b) => a.name.localeCompare(b.name));
@@ -127,8 +138,14 @@ export async function listRemotePresets(source: RemoteContentSource, forceRefres
 				id: item.name,
 				name: m.name.trim(),
 				description: typeof m.description === "string" ? m.description.trim() : "",
+				version: typeof m.version === "number" && Number.isInteger(m.version) && m.version > 0
+					? m.version
+					: 1,
 				icon: typeof m.icon === "string" && m.icon.trim() ? m.icon.trim() : undefined,
 				category: typeof m.category === "string" && m.category.trim() ? m.category.trim() : undefined,
+				welcomeMessage: typeof m.welcomeMessage === "string" && m.welcomeMessage.trim()
+					? m.welcomeMessage.trim()
+					: undefined,
 			};
 		}
 		// GitHub: read the preset.json file.
@@ -161,7 +178,19 @@ export async function ensurePresetCached(
 	const cacheDir = join(root, id);
 	const cachedMetaExists = existsSync(join(cacheDir, "preset.json"));
 	if (cachedMetaExists && !forceRefresh) {
-		return cacheDir;
+		const cachedMeta = readPresetMeta(cacheDir, id);
+		const bundledDir = join(bundledPresetsDir(paths), id);
+		const bundledMeta = readPresetMeta(bundledDir, id);
+		if (bundledMeta && (!cachedMeta || bundledMeta.version > cachedMeta.version)) {
+			copyPresetContents(bundledDir, cacheDir);
+			writeFileSync(join(cacheDir, "preset.json"), readFileSync(join(bundledDir, "preset.json")));
+			logger.info(
+				{ presetId: id, fromVersion: cachedMeta?.version ?? 0, toVersion: bundledMeta.version },
+				"upgraded cached preset from bundled copy",
+			);
+			return cacheDir;
+		}
+		if (cachedMeta) return cacheDir;
 	}
 	// Try the remote hub first.
 	try {
@@ -191,26 +220,79 @@ export async function ensurePresetCached(
  * Uses file-by-file read/write (not cpSync) for robustness against
  * asar-unpacked paths in Electron packaged builds. Skips `preset.json`.
  */
-function copyPresetContents(sourceDir: string, targetDir: string): void {
+function copyPresetContents(
+	sourceDir: string,
+	targetDir: string,
+	options: { backupDir?: string; relativePrefix?: string } = {},
+): void {
 	if (!existsSync(targetDir)) mkdirSync(targetDir, { recursive: true });
 	for (const entry of readdirSync(sourceDir, { withFileTypes: true })) {
 		if (entry.name === "__MACOSX" || entry.name === ".DS_Store" || entry.name === "preset.json") continue;
 		const source = join(sourceDir, entry.name);
 		const target = join(targetDir, entry.name);
+		const relativePath = options.relativePrefix
+			? join(options.relativePrefix, entry.name)
+			: entry.name;
 		if (entry.isDirectory()) {
-			copyPresetContents(source, target);
+			copyPresetContents(source, target, {
+				backupDir: options.backupDir,
+				relativePrefix: relativePath,
+			});
 		} else if (entry.isFile()) {
-			writeFileSync(target, readFileSync(source));
+			const sourceContents = readFileSync(source);
+			if (options.backupDir && existsSync(target)) {
+				const targetContents = readFileSync(target);
+				if (!targetContents.equals(sourceContents)) {
+					const backupPath = join(options.backupDir, relativePath);
+					mkdirSync(dirname(backupPath), { recursive: true });
+					writeFileSync(backupPath, targetContents, { flag: "wx" });
+				}
+			}
+			writeFileSync(target, sourceContents);
 		}
 	}
 }
 
+const PRESET_INSTALLATION_FILE = join(".inno", "preset-installation.json");
+
+interface PresetInstallation {
+	presetId?: string;
+	version?: number;
+}
+
+function readInstalledPresetVersion(workspaceDir: string, presetId: string): number {
+	const markerPath = join(workspaceDir, PRESET_INSTALLATION_FILE);
+	if (!existsSync(markerPath)) return 0;
+	try {
+		const marker = JSON.parse(readFileSync(markerPath, "utf8")) as PresetInstallation;
+		return marker.presetId === presetId && Number.isInteger(marker.version) && Number(marker.version) > 0
+			? Number(marker.version)
+			: 0;
+	} catch {
+		return 0;
+	}
+}
+
+function writePresetInstallation(workspaceDir: string, meta: PresetMeta): void {
+	const markerPath = join(workspaceDir, PRESET_INSTALLATION_FILE);
+	mkdirSync(dirname(markerPath), { recursive: true });
+	writeFileSync(
+		markerPath,
+		`${JSON.stringify({
+			presetId: meta.id,
+			version: meta.version,
+			installedAt: new Date().toISOString(),
+		}, null, 2)}\n`,
+		"utf8",
+	);
+}
+
 /**
- * Open a preset: return its stable dedicated workspace (creating + seeding it
- * with the preset's files on first open). Repeatedly opening the same preset
- * reuses one workspace, so every conversation for that task is archived
- * together. The preset must already be present in the local cache (call
- * `ensurePresetCached` first). Throws on an unknown/invalid preset.
+ * Open a preset: return its stable dedicated workspace, seeding it on first
+ * use and upgrading managed files when preset.json carries a newer version.
+ * Repeatedly opening the same preset reuses one workspace, so every
+ * conversation for that task is archived together. The preset must already be
+ * present in the local cache (call `ensurePresetCached` first).
  */
 export function instantiatePreset(
 	paths: RuntimePaths,
@@ -242,9 +324,30 @@ export function instantiatePreset(
 	// the user's edits / conversation artifacts in that workspace.
 	if (created) {
 		copyPresetContents(srcDir, destDir);
+		writePresetInstallation(destDir, meta);
 		logger.info({ presetId: id, workspaceId: ws.id }, "instantiated preset workspace");
 	} else {
-		logger.info({ presetId: id, workspaceId: ws.id }, "reused existing preset workspace");
+		const installedVersion = readInstalledPresetVersion(destDir, id);
+		if (meta.version > installedVersion) {
+			const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+			const backupDir = join(
+				destDir,
+				".inno",
+				"preset-backups",
+				`v${installedVersion}-to-v${meta.version}-${stamp}`,
+			);
+			copyPresetContents(srcDir, destDir, { backupDir });
+			writePresetInstallation(destDir, meta);
+			logger.info(
+				{ presetId: id, workspaceId: ws.id, fromVersion: installedVersion, toVersion: meta.version },
+				"upgraded existing preset workspace",
+			);
+		} else {
+			logger.info(
+				{ presetId: id, workspaceId: ws.id, version: installedVersion },
+				"reused existing preset workspace",
+			);
+		}
 	}
 	return ws;
 }

@@ -22,6 +22,18 @@ import type { RuntimePaths } from "../runtime.js";
 import { ensureDir } from "../storage/file-store.js";
 import type { ChannelRegistry } from "../channels/channel.js";
 import { logger } from "../logger.js";
+import { questionBridge } from "./question-bridge.js";
+import { userFacingTextFromAssistantMessage } from "./user-facing-output.js";
+import {
+	createContinuationGuardState,
+	isBenignTerminalContinuationError,
+	noteContinuationGuardEvent,
+} from "./conversation-continuation-guard.js";
+import {
+	isDataAnalysisWorkspacePath,
+	resolveDataAnalysisConversationPaths,
+	resolveDataAnalysisRuntimeLimits,
+} from "./data-analysis-runtime-policy.js";
 
 let _runtime: AgentSessionRuntime | null = null;
 let _queue: Promise<void> = Promise.resolve();
@@ -32,6 +44,11 @@ let _configHolder: ConfigHolder | null = null;
 let _cwdResolver: ((sessionPath: string) => string | null) | null = null;
 /** Provider IDs registered into the active model registry by Inno's config. */
 const _registeredProviderIds = new Set<string>();
+const DEFAULT_AGENT_ACTIVE_BUDGET_MS = 180_000;
+const AGENT_IDLE_TIMEOUT_MS = 90_000;
+const AGENT_TOOL_IDLE_TIMEOUT_MS = 150_000;
+const QUESTION_WAIT_TIMEOUT_MS = 30 * 60_000;
+const DEFAULT_PROVIDER_TIMEOUT_MS = 90_000;
 
 export type RuntimeChannelHint = "web" | "feishu" | "wechat" | "qq" | "scheduler" | "cli" | "unknown";
 
@@ -73,6 +90,162 @@ function enqueue<T>(task: () => Promise<T>): Promise<T> {
 	const run = _queue.then(task, task);
 	_queue = run.then(() => undefined, () => undefined);
 	return run;
+}
+
+export async function promptWithDeadline(
+	session: AgentSession,
+	prompt: string,
+	images?: ImageContent[],
+	activeBudgetMs?: number,
+): Promise<void> {
+	const dataAnalysisConversation = isDataAnalysisWorkspacePath(_currentCwd)
+		? resolveDataAnalysisConversationPaths(
+				_currentCwd,
+				session.sessionFile ? basename(session.sessionFile) : "",
+			)
+		: undefined;
+	let dataAnalysisLimits = dataAnalysisConversation
+		? resolveDataAnalysisRuntimeLimits(
+				_currentCwd,
+				dataAnalysisConversation.absoluteDir,
+			)
+		: undefined;
+	let resolvedActiveBudgetMs =
+		activeBudgetMs ?? dataAnalysisLimits?.activeBudgetMs ?? DEFAULT_AGENT_ACTIVE_BUDGET_MS;
+	const refreshDataAnalysisLimits = () => {
+		if (!dataAnalysisConversation) return;
+		dataAnalysisLimits = resolveDataAnalysisRuntimeLimits(
+			_currentCwd,
+			dataAnalysisConversation.absoluteDir,
+		);
+		if (activeBudgetMs === undefined) resolvedActiveBudgetMs = dataAnalysisLimits.activeBudgetMs;
+	};
+	type TimeoutReason = "idle" | "active-budget" | "question-wait";
+	let timeoutReason: TimeoutReason | null = null;
+	let pausedForQuestion = false;
+	let questionWaitStartedAt = 0;
+	let accumulatedActiveMs = 0;
+	let activeSegmentStartedAt = Date.now();
+	let lastActivityAt = activeSegmentStartedAt;
+	let runningToolCount = 0;
+	const continuationGuard = createContinuationGuardState();
+
+	const markActivity = () => {
+		if (!pausedForQuestion && !timeoutReason) lastActivityAt = Date.now();
+	};
+	const pauseForQuestion = () => {
+		if (pausedForQuestion || timeoutReason) return;
+		const now = Date.now();
+		accumulatedActiveMs += now - activeSegmentStartedAt;
+		pausedForQuestion = true;
+		questionWaitStartedAt = now;
+		logger.info(
+			{ accumulatedActiveMs, activeBudgetMs: resolvedActiveBudgetMs },
+			"pausing agent active-time budget while waiting for questionnaire response",
+		);
+	};
+	const resumeAfterQuestion = () => {
+		if (!pausedForQuestion || timeoutReason) return;
+		refreshDataAnalysisLimits();
+		const now = Date.now();
+		pausedForQuestion = false;
+		questionWaitStartedAt = 0;
+		activeSegmentStartedAt = now;
+		lastActivityAt = now;
+		logger.info(
+			{ accumulatedActiveMs, activeBudgetMs: resolvedActiveBudgetMs },
+			"resuming agent active-time budget after questionnaire response",
+		);
+	};
+	const abortForTimeout = (reason: TimeoutReason) => {
+		if (timeoutReason) return;
+		timeoutReason = reason;
+		logger.warn(
+			{
+				reason,
+				activeBudgetMs: resolvedActiveBudgetMs,
+				dataScaleTier: dataAnalysisLimits?.tier,
+				accumulatedActiveMs,
+				idleMs: Date.now() - lastActivityAt,
+				runningToolCount,
+			},
+			"agent turn exceeded activity-aware limit; aborting",
+		);
+		void session.abort().catch((err) => {
+			logger.warn({ err, reason }, "failed to abort timed-out agent turn");
+		});
+	};
+
+	const activityUnsubscribe = session.subscribe((event) => {
+		noteContinuationGuardEvent(continuationGuard, event);
+		markActivity();
+		if (event.type === "tool_execution_start") {
+			runningToolCount += 1;
+		} else if (event.type === "tool_execution_end") {
+			runningToolCount = Math.max(0, runningToolCount - 1);
+			refreshDataAnalysisLimits();
+		}
+	});
+	const questionUnsubscribe = questionBridge.subscribeLifecycle((event) => {
+		if (event === "waiting") pauseForQuestion();
+		else resumeAfterQuestion();
+	});
+	const timer = setInterval(() => {
+		const now = Date.now();
+		if (pausedForQuestion) {
+			if (now - questionWaitStartedAt >= QUESTION_WAIT_TIMEOUT_MS) {
+				abortForTimeout("question-wait");
+			}
+			return;
+		}
+
+		const currentActiveMs = accumulatedActiveMs + (now - activeSegmentStartedAt);
+		if (currentActiveMs >= resolvedActiveBudgetMs) {
+			accumulatedActiveMs = currentActiveMs;
+			abortForTimeout("active-budget");
+			return;
+		}
+
+		const idleLimitMs = runningToolCount > 0
+			? (dataAnalysisLimits?.toolIdleTimeoutMs ?? AGENT_TOOL_IDLE_TIMEOUT_MS)
+			: AGENT_IDLE_TIMEOUT_MS;
+		if (now - lastActivityAt >= idleLimitMs) {
+			abortForTimeout("idle");
+		}
+	}, 1_000);
+
+	try {
+		await session.prompt(prompt, images?.length ? { images } : undefined);
+	} catch (err) {
+		if (isBenignTerminalContinuationError(err, continuationGuard)) {
+			logger.warn(
+				{ sessionFile: session.sessionFile },
+				"suppressed redundant post-compaction continuation after completed assistant response",
+			);
+		} else if (!timeoutReason) {
+			throw err;
+		}
+	} finally {
+		clearInterval(timer);
+		activityUnsubscribe();
+		questionUnsubscribe();
+	}
+
+	if (timeoutReason === "idle") {
+		throw new Error(
+			`RECOVERABLE_RUN_PAUSED: 连续 ${Math.round(AGENT_IDLE_TIMEOUT_MS / 1_000)} 秒没有收到新的模型输出或工具进展，本轮已安全暂停。已生成的文件和对话记录仍然保留；确认外部服务正常后，可输入“继续上一步未完成的阶段”。`,
+		);
+	}
+	if (timeoutReason === "active-budget") {
+		throw new Error(
+			`RECOVERABLE_RUN_PAUSED: 本轮有效运行时间已达到 ${Math.round(resolvedActiveBudgetMs / 60_000)} 分钟并安全暂停；问卷等待时间未计入。已生成的文件和阶段记录仍然保留，可输入“继续上一步未完成的阶段”。`,
+		);
+	}
+	if (timeoutReason === "question-wait") {
+		throw new Error(
+			"RECOVERABLE_RUN_PAUSED: 问卷等待超过 30 分钟，本轮已安全暂停。已生成文件仍然保留；请重新发送选择，或输入“继续上一步未完成的阶段”。",
+		);
+	}
 }
 
 /**
@@ -155,7 +328,6 @@ export async function initSession(
 	// timeout before the model finishes thinking). The value is only applied
 	// as a default — explicit user configuration in settings.json takes
 	// precedence.
-	const DEFAULT_PROVIDER_TIMEOUT_MS = 600_000; // 10 min
 	applyDefaultProviderTimeout(agentDir, DEFAULT_PROVIDER_TIMEOUT_MS);
 
 	// Re-create settingsManager so it picks up any defaults we just wrote.
@@ -584,18 +756,19 @@ export async function runPrompt(prompt: string, images?: ImageContent[]): Promis
 	const promptStartTime = Date.now();
 
 	// Observability: agent lifecycle + tool-call details
-	const promptObserver = createPromptObserver({ promptStartTime });
+	const promptObserver = createPromptObserver({ promptStartTime, sessionId: getCurrentSessionId() });
 	const obsUnsub = session.subscribe(promptObserver);
 
 	const unsubscribe = session.subscribe((event) => {
 		if (event.type === "message_update") {
 			const ev = event.assistantMessageEvent;
-			if (ev.type === "text_delta") {
-				output += ev.delta;
-			} else if (ev.type === "error") {
+			if (ev.type === "error") {
 				streamError = ev.error.errorMessage || `LLM API error (stopReason: ${ev.error.stopReason})`;
 				logger.error({ errorMessage: streamError, stopReason: ev.error.stopReason, elapsedMs: Date.now() - promptStartTime }, "LLM API stream error in runPrompt");
 			}
+		} else if (event.type === "message_end") {
+			const visibleText = userFacingTextFromAssistantMessage(event.message);
+			if (visibleText) output = visibleText;
 		} else if (event.type === "auto_retry_start") {
 			obsLogger.warn({
 				event: "auto_retry_start",
@@ -624,7 +797,7 @@ export async function runPrompt(prompt: string, images?: ImageContent[]): Promis
 	});
 
 	try {
-		await session.prompt(prompt, images?.length ? { images } : undefined);
+		await promptWithDeadline(session, prompt, images);
 	} finally {
 		unsubscribe();
 		obsUnsub();
@@ -748,19 +921,20 @@ export function runPromptStreaming(
 		const promptStartTime = Date.now();
 
 		// Observability: agent lifecycle + tool-call details
-		const promptObserver = createPromptObserver({ promptStartTime });
+		const promptObserver = createPromptObserver({ promptStartTime, sessionId: getCurrentSessionId() });
 		const obsUnsub = session.subscribe(promptObserver);
 
 		const unsubscribe = session.subscribe((event) => {
 			onEvent(event);
 			if (event.type === "message_update") {
 				const ev = event.assistantMessageEvent;
-				if (ev.type === "text_delta") {
-					output += ev.delta;
-				} else if (ev.type === "error") {
+				if (ev.type === "error") {
 					streamError = ev.error.errorMessage || `LLM API error (stopReason: ${ev.error.stopReason})`;
 					logger.error({ errorMessage: streamError, stopReason: ev.error.stopReason, elapsedMs: Date.now() - promptStartTime }, "LLM API stream error in runPromptStreaming");
 				}
+			} else if (event.type === "message_end") {
+				const visibleText = userFacingTextFromAssistantMessage(event.message);
+				if (visibleText) output = visibleText;
 			} else if (event.type === "auto_retry_start") {
 				obsLogger.warn({
 					event: "auto_retry_start",
@@ -788,7 +962,7 @@ export function runPromptStreaming(
 			}
 		});
 		try {
-			await session.prompt(prompt, images?.length ? { images } : undefined);
+			await promptWithDeadline(session, prompt, images);
 		} finally {
 			unsubscribe();
 			obsUnsub();
@@ -823,19 +997,20 @@ export function runPromptStreamingInSession(
 		const promptStartTime = Date.now();
 
 		// Observability: agent lifecycle + tool-call details
-		const promptObserver = createPromptObserver({ promptStartTime });
+		const promptObserver = createPromptObserver({ promptStartTime, sessionId: getCurrentSessionId() });
 		const obsUnsub = session.subscribe(promptObserver);
 
 		const unsubscribe = session.subscribe((event) => {
 			onEvent(event);
 			if (event.type === "message_update") {
 				const ev = event.assistantMessageEvent;
-				if (ev.type === "text_delta") {
-					output += ev.delta;
-				} else if (ev.type === "error") {
+				if (ev.type === "error") {
 					streamError = ev.error.errorMessage || `LLM API error (stopReason: ${ev.error.stopReason})`;
 					logger.error({ errorMessage: streamError, stopReason: ev.error.stopReason, sessionPath, elapsedMs: Date.now() - promptStartTime }, "LLM API stream error in runPromptStreamingInSession");
 				}
+			} else if (event.type === "message_end") {
+				const visibleText = userFacingTextFromAssistantMessage(event.message);
+				if (visibleText) output = visibleText;
 			} else if (event.type === "auto_retry_start") {
 				obsLogger.warn({
 					event: "auto_retry_start",
@@ -863,7 +1038,7 @@ export function runPromptStreamingInSession(
 			}
 		});
 		try {
-			await session.prompt(prompt, images?.length ? { images } : undefined);
+			await promptWithDeadline(session, prompt, images);
 		} finally {
 			unsubscribe();
 			obsUnsub();

@@ -996,7 +996,11 @@ export function WorkspaceBrowser() {
 		e.preventDefault();
 		setIsDragOver(false);
 		if (e.dataTransfer.files?.length) {
-			void workspaceStore.uploadFiles(selectedParentPath(), e.dataTransfer.files);
+			void workspaceStore.uploadFiles(
+				selectedParentPath(),
+				e.dataTransfer.files,
+				sessionsStore.currentSessionId ?? undefined,
+			);
 		}
 	}, [selectedParentPath, isExternalFileDrag]);
 

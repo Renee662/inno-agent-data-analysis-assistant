@@ -1,0 +1,9 @@
+{
+	"id": "data-analysis-assistant",
+	"name": "数据分析助手",
+	"description": "上传 CSV、Excel 等数据，完成数据体检、清洗、统计分析与可视化，并生成可复现、可审阅的分析报告。",
+	"version": 23,
+	"welcomeMessage": "请上传 CSV、TSV、XLSX 或 XLS 数据。为了减少误解，若是公开数据集，可说明数据集名称和来源；若不是，最好说明数据集基本情况、研究背景以及主要字段含义。也可以一并上传 README、代码本、问卷或数据说明文档。\n\n如果暂时不了解这些信息，也可以直接上传；助手会先检查文件，只询问会影响本次分析的关键问题。",
+	"icon": "chart-no-axes-combined",
+	"category": "研究与分析"
+}

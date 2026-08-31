@@ -1,0 +1,4 @@
+interface:
+  display_name: "数据处理方案规划"
+  short_description: "根据已确认的分析任务制定缺失值、编码、异常值等处理计划"
+  default_prompt: "Use $plan-data-preparation to draft a reviewable data-processing plan for my approved analysis task."

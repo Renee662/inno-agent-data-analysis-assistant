@@ -1,8 +1,85 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { motion } from "motion/react";
+import { AlertCircle, Check, CircleHelp, LoaderCircle } from "lucide-react";
 import type { PendingQuestion, QuestionAnswer, QuestionData, QuestionnaireResult } from "../types/chat.js";
 import { chatStore } from "../stores/chat-store.js";
+import { getWorkspaceFile, workspaceFileUrl } from "../api/workspace.js";
+
+type TaskCardRecord = Record<string, unknown>;
+
+function textValue(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function TaskCardPreview({ q, workspaceId }: { q: QuestionData; workspaceId: string | null }) {
+	const [content, setContent] = useState<string | null>(null);
+	const [error, setError] = useState<string | null>(null);
+
+	useEffect(() => {
+		let active = true;
+		setContent(null);
+		setError(null);
+		if (!q.documentPath) return () => { active = false; };
+		void getWorkspaceFile(q.documentPath, workspaceId ?? undefined, true)
+			.then((file) => { if (active) setContent(file.content ?? ""); })
+			.catch(() => { if (active) setError("任务卡读取失败，请刷新后重试。"); });
+		return () => { active = false; };
+	}, [q.documentPath, workspaceId]);
+
+	if (!q.documentPath) return null;
+	if (error) return <div className="rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-700">{error}</div>;
+	if (content === null) {
+		return <div className="flex items-center gap-2 rounded-lg border border-[var(--inno-border)] px-3 py-3 text-xs text-[var(--inno-text-muted)]"><LoaderCircle className="h-4 w-4 animate-spin" />正在载入任务卡…</div>;
+	}
+
+	if (!q.documentPath.toLowerCase().endsWith(".json")) {
+		return (
+			<section className="max-h-72 overflow-y-auto rounded-lg border border-[var(--inno-border)] bg-[var(--inno-surface-muted)] p-3 text-sm">
+				<markdown-artifact content={content} />
+			</section>
+		);
+	}
+
+	let card: TaskCardRecord;
+	try {
+		card = JSON.parse(content) as TaskCardRecord;
+	} catch {
+		return <div className="rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-700">任务卡 JSON 格式无效，暂不能确认。</div>;
+	}
+	const metadata = card.variable_metadata && typeof card.variable_metadata === "object"
+		? card.variable_metadata as Record<string, TaskCardRecord>
+		: {};
+	const labelFor = (column: unknown) => {
+		if (typeof column !== "string") return String(column ?? "");
+		return textValue(metadata[column]?.display_name) ?? column;
+	};
+	const predictors = Array.isArray(card.predictors) ? card.predictors.map(labelFor) : [];
+	const controls = Array.isArray(card.controls) ? card.controls.map(labelFor) : [];
+	const rows = [
+		["研究问题", textValue(card.research_question)],
+		["分析单位", textValue(card.unit_of_analysis) ?? "尚待确认"],
+		["结果变量", labelFor(card.outcome)],
+		["预测变量", predictors.length ? `${predictors.join("、")}（共 ${predictors.length} 项）` : "未指定"],
+		["控制变量", controls.length ? controls.join("、") : "无"],
+	].filter((row) => row[1]);
+
+	return (
+		<section className="overflow-hidden rounded-lg border border-[var(--inno-border)] bg-[var(--inno-surface-muted)]">
+			<div className="border-b border-[var(--inno-border)] bg-[var(--inno-surface)] px-3 py-2">
+				<p className="text-xs font-semibold text-[var(--inno-text)]">{q.documentTitle || "分析任务卡"}</p>
+				<p className="mt-0.5 text-[11px] text-[var(--inno-text-muted)]">{textValue(card.report_title) ?? textValue(card.title)}</p>
+			</div>
+			<div className="max-h-72 space-y-2 overflow-y-auto p-3 text-xs leading-5">
+				{textValue(card.dataset_summary) ? <p className="text-[var(--inno-text-muted)]">{textValue(card.dataset_summary)}</p> : null}
+				<dl className="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-2 gap-y-1.5">
+					{rows.map(([label, value]) => <div key={label} className="contents"><dt className="font-medium text-[var(--inno-text-muted)]">{label}</dt><dd className="text-[var(--inno-text)]">{value}</dd></div>)}
+				</dl>
+			</div>
+			{q.documentCaption ? <p className="border-t border-[var(--inno-border)] px-3 py-2 text-[11px] text-[var(--inno-text-muted)]">{q.documentCaption}</p> : null}
+		</section>
+	);
+}
 
 function OptionRow({
 	label,
@@ -21,6 +98,8 @@ function OptionRow({
 }) {
 	return (
 		<button
+			type="button"
+			aria-pressed={selected}
 			className={`flex w-full items-start gap-2.5 rounded-md border px-3 py-2 text-left text-[13px] transition-colors ${
 				selected
 					? "border-[var(--inno-accent)] bg-[var(--inno-accent-soft)] text-[var(--inno-text)]"
@@ -28,15 +107,16 @@ function OptionRow({
 			}`}
 			onClick={onSelect}
 			onMouseEnter={onFocus}
+			onFocus={onFocus}
 		>
-			<span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-sm border border-[var(--inno-border-strong)]">
+			<span className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center border border-[var(--inno-border-strong)] ${multi ? "rounded-sm" : "rounded-full"}`}>
 				{selected ? (
-					<span className={`block ${multi ? "h-2 w-2 rounded-sm bg-[var(--inno-accent)]" : "h-2 w-2 rounded-full bg-[var(--inno-accent)]"}`} />
+					<span className={`block h-2 w-2 bg-[var(--inno-accent)] ${multi ? "rounded-sm" : "rounded-full"}`} />
 				) : null}
 			</span>
 			<span className="min-w-0 flex-1">
 				<span className="font-medium">{label}</span>
-				{description ? <span className="mt-0.5 block text-xs text-[var(--inno-text-muted)]">{description}</span> : null}
+				{description ? <span className="mt-0.5 block text-xs leading-5 text-[var(--inno-text-muted)]">{description}</span> : null}
 			</span>
 		</button>
 	);
@@ -52,115 +132,167 @@ function QuestionTab({
 	setFocusedOption,
 	customDraft,
 	onCustomDraftChange,
+	workspaceId,
 }: {
 	q: QuestionData;
 	questionIndex: number;
 	answer: QuestionAnswer | undefined;
-	onAnswer: (a: QuestionAnswer) => void;
+	onAnswer: (answer: QuestionAnswer) => void;
 	onDismiss: () => void;
 	focusedOption: number;
-	setFocusedOption: (i: number) => void;
+	setFocusedOption: (index: number) => void;
 	customDraft: string;
 	onCustomDraftChange: (text: string) => void;
+	workspaceId: string | null;
 }) {
 	const { t } = useTranslation();
+	const [imageFailed, setImageFailed] = useState(false);
 	const isMulti = q.multiSelect === true;
-	const hasPreview = q.options.some((o) => o.preview);
-	const selectedLabels = new Set(answer?.selected ?? (answer?.answer ? [answer.answer] : []));
-	// 选项优先：当前题已选了选项/多选时，文字输入框不生效
+	const hasPreview = q.options.some((option) => option.preview);
 	const hasOptionAnswer = answer?.kind === "option" || answer?.kind === "multi";
+	const selectedLabels = new Set(
+		answer?.kind === "multi"
+			? (answer.selected ?? [])
+			: answer?.kind === "option" && answer.answer
+				? [answer.answer]
+				: [],
+	);
 
 	const handleOptionClick = (label: string) => {
+		const notes = customDraft.trim() || undefined;
 		if (isMulti) {
 			const next = new Set(selectedLabels);
 			if (next.has(label)) next.delete(label);
 			else next.add(label);
-			if (next.size === 0) {
-				// 多选全部脱选 → 撤回答案
-				onAnswer({ questionIndex, question: q.question, kind: "multi", answer: null, selected: [] });
-			} else {
-				onAnswer({
-					questionIndex,
-					question: q.question,
-					kind: "multi",
-					answer: null,
-					selected: Array.from(next),
-				});
-			}
-		} else {
-			// 单选：再次点击已选项 = 脱选，回到未答
-			if (selectedLabels.has(label)) {
-				onAnswer({ questionIndex, question: q.question, kind: "option", answer: null });
-			} else {
-				onAnswer({
-					questionIndex,
-					question: q.question,
-					kind: "option",
-					answer: label,
-					preview: q.options.find((o) => o.label === label)?.preview,
-				});
-			}
+			onAnswer({
+				questionIndex,
+				question: q.question,
+				kind: "multi",
+				answer: null,
+				selected: Array.from(next),
+				notes,
+			});
+			return;
 		}
+
+		if (selectedLabels.has(label)) {
+			onAnswer(
+				notes
+					? { questionIndex, question: q.question, kind: "custom", answer: notes }
+					: { questionIndex, question: q.question, kind: "option", answer: null },
+			);
+			return;
+		}
+
+		onAnswer({
+			questionIndex,
+			question: q.question,
+			kind: "option",
+			answer: label,
+			notes,
+			preview: q.options.find((option) => option.label === label)?.preview,
+		});
 	};
 
-	// 输入即作答：文字非空且未选选项时立刻同步为 custom 答案；清空则撤回。
-	// 草稿始终写入父组件（跨 tab 持久），但只在无选项答案时才成为正式答案。
 	const handleCustomChange = (text: string) => {
 		onCustomDraftChange(text);
-		if (hasOptionAnswer) return; // 选项优先，文字不生效
 		const trimmed = text.trim();
+		if (hasOptionAnswer && answer) {
+			onAnswer({ ...answer, notes: trimmed || undefined });
+			return;
+		}
+		if (isMulti) return;
 		if (trimmed) {
 			onAnswer({ questionIndex, question: q.question, kind: "custom", answer: trimmed });
 		} else if (answer?.kind === "custom") {
-			// 文字清空：撤回 custom 作答
 			onAnswer({ questionIndex, question: q.question, kind: "custom", answer: null });
 		}
 	};
 
 	const preview = hasPreview ? q.options[focusedOption]?.preview : undefined;
+	const imageUrl = q.imagePath
+		? workspaceFileUrl(q.imagePath, workspaceId ?? undefined)
+		: undefined;
+
+	useEffect(() => {
+		setImageFailed(false);
+	}, [imageUrl]);
 
 	return (
 		<div className="space-y-3">
-			<p className="text-sm font-medium text-[var(--inno-text)]">{q.question}</p>
+			<TaskCardPreview q={q} workspaceId={workspaceId} />
+			{imageUrl && !imageFailed ? (
+				<figure className="overflow-hidden rounded-lg border border-[var(--inno-border)] bg-[var(--inno-surface-muted)]">
+					<a
+						href={imageUrl}
+						target="_blank"
+						rel="noreferrer"
+						className="flex max-h-56 min-h-32 items-center justify-center bg-white p-2"
+						title={t("question.openImage")}
+					>
+						<img
+							src={imageUrl}
+							alt={q.imageAlt || t("question.referenceImage")}
+							className="block max-h-52 max-w-full object-contain"
+							onError={() => setImageFailed(true)}
+						/>
+					</a>
+					<figcaption className="border-t border-[var(--inno-border)] px-3 py-2 text-xs leading-5 text-[var(--inno-text-muted)]">
+						{q.imageCaption || t("question.openImage")}
+					</figcaption>
+				</figure>
+			) : null}
 
-			<div className={hasPreview ? "flex gap-3" : ""}>
-				<div className={`space-y-1.5 ${hasPreview ? "w-1/2" : ""}`}>
-					{q.options.map((opt, i) => (
+			<div>
+				<p className="text-sm font-semibold leading-6 text-[var(--inno-text)]">{q.question}</p>
+				<p className="mt-1 text-xs leading-5 text-[var(--inno-text-muted)]">
+					{isMulti ? t("question.multiSelectHint") : t("question.singleSelectHint")}
+				</p>
+			</div>
+
+			<div className={hasPreview ? "flex flex-col gap-3 lg:flex-row" : ""}>
+				<div className={`space-y-2 ${hasPreview ? "lg:w-1/2" : ""}`}>
+					{q.options.map((option, index) => (
 						<OptionRow
-							key={opt.label}
-							label={opt.label}
-							description={opt.description}
-							selected={selectedLabels.has(opt.label)}
+							key={option.label}
+							label={option.label}
+							description={option.description}
+							selected={selectedLabels.has(option.label)}
 							multi={isMulti}
-							onSelect={() => handleOptionClick(opt.label)}
-							onFocus={() => setFocusedOption(i)}
+							onSelect={() => handleOptionClick(option.label)}
+							onFocus={() => setFocusedOption(index)}
 						/>
 					))}
 
-					<div className="flex flex-col gap-1 pt-1">
-						<input
-							type="text"
-							className={`min-w-0 flex-1 rounded-md border px-2.5 py-1.5 text-[13px] focus-visible:outline-none focus-visible:shadow-[var(--inno-ring)] ${
-								hasOptionAnswer
-									? "cursor-not-allowed border-[var(--inno-border)] bg-[var(--inno-surface-muted)] text-[var(--inno-text-subtle)]"
-									: "border-[var(--inno-border)] bg-[var(--inno-surface)] text-[var(--inno-text)] focus-visible:border-[var(--inno-focus-border)]"
-							}`}
-							placeholder={hasOptionAnswer ? t("question.optionSelectedHint") : t("question.typeSomething")}
+					<label className="flex flex-col gap-1.5 pt-1">
+						<span className="text-xs font-medium text-[var(--inno-text-muted)]">
+							{hasOptionAnswer ? t("question.optionalNote") : t("question.customAnswer")}
+						</span>
+						<textarea
+							rows={2}
+							className="min-w-0 resize-y rounded-md border border-[var(--inno-border)] bg-[var(--inno-surface)] px-2.5 py-2 text-[13px] text-[var(--inno-text)] focus-visible:border-[var(--inno-focus-border)] focus-visible:outline-none focus-visible:shadow-[var(--inno-ring)]"
+							placeholder={
+								isMulti && !hasOptionAnswer
+									? t("question.multiNotePlaceholder")
+									: hasOptionAnswer
+										? t("question.optionalNotePlaceholder")
+										: t("question.typeSomething")
+							}
 							value={customDraft}
-							disabled={hasOptionAnswer}
-							onChange={(e) => handleCustomChange(e.target.value)}
+							onChange={(event) => handleCustomChange(event.target.value)}
 						/>
-					</div>
+					</label>
 				</div>
 
 				{hasPreview && preview ? (
-					<div className="w-1/2 rounded-md border border-[var(--inno-border)] bg-[var(--inno-surface-muted)] p-3">
+					<div className="rounded-md border border-[var(--inno-border)] bg-[var(--inno-surface-muted)] p-3 lg:w-1/2">
 						<pre className="whitespace-pre-wrap font-mono text-xs text-[var(--inno-text)]">{preview}</pre>
 					</div>
 				) : null}
 			</div>
 
 			<button
+				type="button"
 				className="text-xs text-[var(--inno-text-subtle)] underline hover:text-[var(--inno-text-muted)]"
 				onClick={onDismiss}
 			>
@@ -170,73 +302,87 @@ function QuestionTab({
 	);
 }
 
-export function QuestionDialog({ pending }: { pending: PendingQuestion }) {
+export function QuestionDialog({ pending, workspaceId }: { pending: PendingQuestion; workspaceId: string | null }) {
 	const { t } = useTranslation();
 	const { questionId, params } = pending;
 	const questions = params.questions;
 	const [activeTab, setActiveTab] = useState(0);
 	const [answers, setAnswers] = useState<Map<number, QuestionAnswer>>(new Map());
 	const [focusedOptions, setFocusedOptions] = useState<number[]>(questions.map(() => 0));
-	// 每个 tab 的自定义文字草稿，提升到外层避免切换 tab 丢失
 	const [customDrafts, setCustomDrafts] = useState<Map<number, string>>(new Map());
+	const [isSubmitting, setIsSubmitting] = useState(false);
+	const [submitError, setSubmitError] = useState("");
 
-	const handleAnswer = useCallback(
-		(a: QuestionAnswer) => {
-			setAnswers((prev) => {
-				const next = new Map(prev);
-				// custom/option 答案被撤回（answer 为 null）视为未答，移出 Map。
-				// 否则 allAnswered 会把空答案误判为已答。
-				if ((a.kind === "custom" || a.kind === "option") && a.answer === null) {
-					next.delete(a.questionIndex);
-				} else if (a.kind === "multi" && (!a.selected || a.selected.length === 0)) {
-					next.delete(a.questionIndex);
-				} else {
-					next.set(a.questionIndex, a);
-				}
-				return next;
-			});
-		},
-		[],
-	);
+	const handleAnswer = useCallback((answer: QuestionAnswer) => {
+		setSubmitError("");
+		setAnswers((previous) => {
+			const next = new Map(previous);
+			if ((answer.kind === "custom" || answer.kind === "option") && answer.answer === null) {
+				next.delete(answer.questionIndex);
+			} else if (answer.kind === "multi" && (!answer.selected || answer.selected.length === 0)) {
+				next.delete(answer.questionIndex);
+			} else {
+				next.set(answer.questionIndex, answer);
+			}
+			return next;
+		});
+	}, []);
 
-	const handleDismiss = useCallback(() => {
-		void chatStore.dismissQuestion(questionId);
-	}, [questionId]);
+	const handleDismiss = useCallback(async () => {
+		setIsSubmitting(true);
+		setSubmitError("");
+		try {
+			await chatStore.dismissQuestion(questionId);
+		} catch (error) {
+			setSubmitError(error instanceof Error ? error.message : t("question.submitError"));
+			setIsSubmitting(false);
+		}
+	}, [questionId, t]);
 
-	// 逐题推进：只要当前题答了，就能点按钮推进或提交。
 	const currentAnswered = answers.has(activeTab);
 	const isLast = activeTab === questions.length - 1;
+	const allAnswered = questions.every((_, index) => answers.has(index));
+	const unansweredCount = questions.length - answers.size;
 
-	const handleClick = useCallback(() => {
+	const handleClick = useCallback(async () => {
 		if (!answers.has(activeTab)) return;
-		if (isLast) {
-			// 最后一题（或单题）：提交全部已答题目。未答的题不在 answers 里，自然不发。
-			const result: QuestionnaireResult = {
-				answers: Array.from(answers.values()),
-				cancelled: false,
-			};
-			void chatStore.submitQuestionResponse(questionId, result);
-		} else {
-			// 暂存当前答案，跳到下一题
-			setActiveTab((prev) => Math.min(prev + 1, questions.length - 1));
+		if (!isLast) {
+			setActiveTab((previous) => Math.min(previous + 1, questions.length - 1));
+			return;
 		}
-	}, [questionId, answers, activeTab, isLast, questions.length]);
 
-	const setFocusedForTab = useCallback(
-		(tab: number, optionIdx: number) => {
-			setFocusedOptions((prev) => {
-				const next = [...prev];
-				next[tab] = optionIdx;
-				return next;
-			});
-		},
-		[],
-	);
+		const firstUnanswered = questions.findIndex((_, index) => !answers.has(index));
+		if (firstUnanswered >= 0) {
+			setActiveTab(firstUnanswered);
+			return;
+		}
 
-	const setCustomDraftForTab = useCallback((tab: number, text: string) => {
-		setCustomDrafts((prev) => {
-			const next = new Map(prev);
-			next.set(tab, text);
+		const result: QuestionnaireResult = {
+			answers: Array.from(answers.values()).sort((left, right) => left.questionIndex - right.questionIndex),
+			cancelled: false,
+		};
+		setIsSubmitting(true);
+		setSubmitError("");
+		try {
+			await chatStore.submitQuestionResponse(questionId, result);
+		} catch (error) {
+			setSubmitError(error instanceof Error ? error.message : t("question.submitError"));
+			setIsSubmitting(false);
+		}
+	}, [activeTab, answers, isLast, questionId, questions, t]);
+
+	const setFocusedForTab = useCallback((tab: number, optionIndex: number) => {
+		setFocusedOptions((previous) => {
+			const next = [...previous];
+			next[tab] = optionIndex;
+			return next;
+		});
+	}, []);
+
+	const setCustomDraftForTab = useCallback((tab: number, value: string) => {
+		setCustomDrafts((previous) => {
+			const next = new Map(previous);
+			next.set(tab, value);
 			return next;
 		});
 	}, []);
@@ -248,49 +394,83 @@ export function QuestionDialog({ pending }: { pending: PendingQuestion }) {
 			animate={{ opacity: 1, y: 0 }}
 			transition={{ duration: 0.3, ease: "easeOut" }}
 		>
-			<div className="w-full max-w-[76%] rounded-lg border border-[var(--inno-accent-soft)] bg-[var(--inno-surface)] px-4 py-3 shadow-sm">
+			<div className="w-full max-w-[88%] rounded-xl border border-[var(--inno-accent-soft)] bg-[var(--inno-surface)] px-4 py-4 shadow-sm sm:px-5">
+				<div className="mb-3 flex items-start gap-2.5 border-b border-[var(--inno-border)] pb-3">
+					<span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[var(--inno-accent-soft)] text-[var(--inno-accent)]">
+						<CircleHelp size={16} />
+					</span>
+					<div>
+						<p className="text-sm font-semibold text-[var(--inno-text)]">{t("question.decisionTitle")}</p>
+						<p className="mt-0.5 text-xs leading-5 text-[var(--inno-text-muted)]">{t("question.decisionDescription")}</p>
+					</div>
+				</div>
+
 				{questions.length > 1 ? (
-					<div className="mb-3 flex gap-1">
-						{questions.map((q, i) => (
+					<div className="mb-3 flex flex-wrap gap-1.5">
+						{questions.map((question, index) => (
 							<button
-								key={q.header}
-								className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
-									activeTab === i
+								type="button"
+								key={`${question.header}-${index}`}
+								className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+									activeTab === index
 										? "bg-[var(--inno-accent-soft)] text-[var(--inno-accent)]"
 										: "bg-[var(--inno-surface-muted)] text-[var(--inno-text-muted)] hover:bg-[var(--inno-surface-muted)]"
 								}`}
-								onClick={() => setActiveTab(i)}
+								onClick={() => setActiveTab(index)}
 							>
-								{q.header}
+								{answers.has(index) ? <Check size={12} /> : null}
+								{question.header}
 							</button>
 						))}
 					</div>
 				) : null}
 
-				<QuestionTab
-					q={questions[activeTab]}
-					questionIndex={activeTab}
-					answer={answers.get(activeTab)}
-					onAnswer={handleAnswer}
-					onDismiss={handleDismiss}
-					focusedOption={focusedOptions[activeTab]}
-					setFocusedOption={(i) => setFocusedForTab(activeTab, i)}
-					customDraft={customDrafts.get(activeTab) ?? ""}
-					onCustomDraftChange={(text) => setCustomDraftForTab(activeTab, text)}
-				/>
+				<fieldset disabled={isSubmitting}>
+					<QuestionTab
+						q={questions[activeTab]}
+						questionIndex={activeTab}
+						answer={answers.get(activeTab)}
+						onAnswer={handleAnswer}
+						onDismiss={() => { void handleDismiss(); }}
+						focusedOption={focusedOptions[activeTab]}
+						setFocusedOption={(index) => setFocusedForTab(activeTab, index)}
+						customDraft={customDrafts.get(activeTab) ?? ""}
+						onCustomDraftChange={(value) => setCustomDraftForTab(activeTab, value)}
+						workspaceId={workspaceId}
+					/>
+				</fieldset>
+
+				{submitError ? (
+					<div className="mt-3 flex items-start gap-2 rounded-md border border-[var(--inno-danger-border)] bg-[var(--inno-danger-bg)] px-3 py-2 text-xs text-[var(--inno-danger)]">
+						<AlertCircle className="mt-0.5 shrink-0" size={14} />
+						<span>{t("question.submitErrorDetail", { error: submitError })}</span>
+					</div>
+				) : null}
 
 				<div className="mt-3 flex items-center justify-end gap-2">
 					{questions.length > 1 ? (
 						<span className="text-xs text-[var(--inno-text-subtle)]">
-							{activeTab + 1} / {questions.length}
+							{t("question.progress", { current: activeTab + 1, total: questions.length })}
 						</span>
 					) : null}
 					<button
-						className={`rounded-lg px-4 py-1.5 text-sm font-medium transition-colors ${ currentAnswered ? "inno-primary-button" : "cursor-not-allowed bg-[var(--inno-surface-muted)] text-[var(--inno-text-subtle)]" }`}
-						disabled={!currentAnswered}
-						onClick={handleClick}
+						type="button"
+						className={`inline-flex items-center gap-1.5 rounded-lg px-4 py-1.5 text-sm font-medium transition-colors ${
+							currentAnswered && !isSubmitting
+								? "inno-primary-button"
+								: "cursor-not-allowed bg-[var(--inno-surface-muted)] text-[var(--inno-text-subtle)]"
+						}`}
+						disabled={!currentAnswered || isSubmitting}
+						onClick={() => { void handleClick(); }}
 					>
-						{isLast ? t("question.submit") : t("question.submitNext")}
+						{isSubmitting ? <LoaderCircle className="animate-spin" size={14} /> : null}
+						{isSubmitting
+							? t("question.submitting")
+							: isLast && allAnswered
+								? t("question.submit")
+								: isLast
+									? t("question.completeMissing", { count: unansweredCount })
+									: t("question.submitNext")}
 					</button>
 				</div>
 			</div>

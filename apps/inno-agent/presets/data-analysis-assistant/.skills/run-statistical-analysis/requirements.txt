@@ -1,0 +1,7 @@
+# Compatibility manifest only. Runtime installation uses apps/inno-agent/scripts/data-analysis-requirements.txt.
+numpy>=2.0
+pandas>=2.2
+scipy>=1.12
+statsmodels>=0.14
+matplotlib>=3.8
+seaborn>=0.13

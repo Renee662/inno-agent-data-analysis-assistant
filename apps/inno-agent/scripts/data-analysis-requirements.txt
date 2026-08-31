@@ -1,0 +1,10 @@
+# Shared baseline for the bundled data-analysis-assistant preset.
+# This file is installed once into <INNO_DATA_DIR>/python-envs/data-analysis-assistant.
+numpy>=2.0
+pandas>=2.2
+scipy>=1.12
+statsmodels>=0.14
+matplotlib>=3.8
+seaborn>=0.13
+openpyxl>=3.1
+xlrd>=2.0

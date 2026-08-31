@@ -39,6 +39,31 @@ function safeHandler<E>(
 // ---------------------------------------------------------------------------
 
 const MAX_FIELD_LENGTH = 300;
+const SENSITIVE_KEY_RE = /(?:api[-_]?key|authorization|token|secret|password|cookie|credential)/i;
+
+function debugDetailsEnabled(): boolean {
+  return /^(?:1|true|yes|on)$/i.test(process.env.INNO_DEBUG_LOG_BODIES ?? "");
+}
+
+function redact(value: unknown, key = ""): unknown {
+  if (SENSITIVE_KEY_RE.test(key)) return "[REDACTED]";
+  if (typeof value === "string") {
+    return value.replace(
+      /(api[-_]?key|authorization|token|secret|password|cookie)\s*[:=]\s*([^\s,;]+)/gi,
+      "$1=[REDACTED]",
+    );
+  }
+  if (Array.isArray(value)) return value.map((item) => redact(item));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([childKey, childValue]) => [
+        childKey,
+        redact(childValue, childKey),
+      ]),
+    );
+  }
+  return value;
+}
 
 /** Truncate a string to MAX_FIELD_LENGTH, appending a trailer if cut. */
 function truncate(s: string): string {
@@ -49,8 +74,9 @@ function truncate(s: string): string {
 /** Safely stringify any value, truncating the result. */
 function safeStringify(v: unknown): string {
   try {
-    if (typeof v === "string") return truncate(v);
-    return truncate(JSON.stringify(v));
+		const safe = redact(v);
+		if (typeof safe === "string") return truncate(safe);
+		return truncate(JSON.stringify(safe));
   } catch {
     return "[unserializable]";
   }
@@ -227,12 +253,14 @@ export function createObservabilityExtension(): ExtensionFactory {
 export interface PromptObserverOptions {
   /** Timestamp (ms) when the prompt started, used for elapsedMs in retries. */
   promptStartTime: number;
+  /** Session bound to this prompt; captured before tool execution starts. */
+  sessionId?: string;
 }
 
 export function createPromptObserver(
   opts: PromptObserverOptions,
 ): (event: AgentSessionEvent) => void {
-  const { promptStartTime } = opts;
+  const { promptStartTime, sessionId } = opts;
 
   return (event: AgentSessionEvent) => {
     try {
@@ -320,10 +348,11 @@ export function createPromptObserver(
         // ---- Tool execution (the key details!) ----------------------------
 
         case "tool_execution_start": {
-          const argsSummary = summarizeArgs(event.toolName, event.args);
+			const argsSummary = debugDetailsEnabled() ? summarizeArgs(event.toolName, event.args) : "";
           toolStartTimes.set(event.toolCallId, Date.now());
           obsLogger.info({
             event: "tool_execution_start",
+			sessionId: sessionId || undefined,
             toolName: event.toolName,
             toolCallId: event.toolCallId,
             args: argsSummary || undefined,
@@ -334,9 +363,10 @@ export function createPromptObserver(
         case "tool_execution_end": {
           const elapsed = toolStartTimes.get(event.toolCallId);
           toolStartTimes.delete(event.toolCallId);
-          const resultSummary = summarizeResult(event.result);
+			const resultSummary = debugDetailsEnabled() ? summarizeResult(event.result) : "";
           obsLogger.info({
             event: "tool_execution_end",
+			sessionId: sessionId || undefined,
             toolName: event.toolName,
             toolCallId: event.toolCallId,
             isError: event.isError,

@@ -1,0 +1,4 @@
+# Compatibility manifest only. Runtime installation uses apps/inno-agent/scripts/data-analysis-requirements.txt.
+pandas>=2.2
+openpyxl>=3.1
+xlrd>=2.0

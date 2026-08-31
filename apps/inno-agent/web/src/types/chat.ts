@@ -29,6 +29,7 @@ export interface QuestionOption {
 	label: string;
 	description: string;
 	preview?: string;
+	approvalDecision?: "approve" | "revise" | "reject" | "help";
 }
 
 export interface QuestionData {
@@ -36,6 +37,18 @@ export interface QuestionData {
 	header: string;
 	options: QuestionOption[];
 	multiSelect?: boolean;
+	questionKind?: "decision" | "task-card" | "observation";
+	approvalAction?: "approve-analysis-task" | "approve-workflow-support" | "approve-model-specification" | "approve-final-report";
+	approvalArtifactPath?: string;
+	approvalArtifactSha256?: string;
+	/** Workspace-relative JSON/Markdown shown as a compact questionnaire card. */
+	documentPath?: string;
+	documentTitle?: string;
+	documentCaption?: string;
+	/** Workspace-relative image displayed with this question. */
+	imagePath?: string;
+	imageAlt?: string;
+	imageCaption?: string;
 }
 
 export interface PendingQuestion {

@@ -1,5 +1,5 @@
 import { apiFetch, streamSSE, streamSSEGet } from "./client.js";
-import type { ChatStreamEvent } from "../types/chat.js";
+import type { ChatStreamEvent, QuestionnaireResult } from "../types/chat.js";
 
 export interface InlineImage {
 	data: string;
@@ -29,6 +29,13 @@ export async function abortChat(): Promise<void> {
 	} catch {
 		// best-effort — the SSE close handler is a fallback
 	}
+}
+
+export async function answerQuestion(questionId: string, result: QuestionnaireResult): Promise<void> {
+	await apiFetch<{ accepted: boolean }>("/api/chat/question-response", {
+		method: "POST",
+		body: JSON.stringify({ questionId, result }),
+	});
 }
 
 /**

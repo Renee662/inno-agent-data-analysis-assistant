@@ -1,0 +1,4 @@
+interface:
+  display_name: "执行数据处理方案"
+  short_description: "Execute an approved plan and create auditable cleaned data"
+  default_prompt: "Use $execute-data-preparation to apply an approved preparation plan to a copy of the source table and stop before modeling."

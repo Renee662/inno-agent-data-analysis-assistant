@@ -19,6 +19,10 @@ apps/*/web/dist/
 .idea/
 .vscode/
 
+# Python bytecode caches (generated locally, never source artifacts)
+__pycache__/
+*.py[cod]
+
 # Local agent / tooling outputs
 graphify-out/
 .claude/
@@ -29,3 +33,18 @@ build/icon.iconset/
 # Docs (local only)
 apps/inno-agent/docs/
 .zcode/
+# 本地运行文件，不上传
+/tmp/
+/work/
+
+# Python 运行与测试缓存，不上传
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 本地协作说明，不上传
+AGENTS.md
+CLAUDE.md
