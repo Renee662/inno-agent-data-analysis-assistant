@@ -1,140 +1,111 @@
 # Quickstart
 
-5 分钟把 Inno Agent 跑起来。
+本项目基于 Inno Agent 二次开发，集成“数据分析助手”工作区，用于完成结构化数据的导入、探索性分析、数据准备、统计建模、模型诊断与报告生成。
 
-## 1. 前置条件
+## 1. 环境要求
 
-- Node.js **>= 20.6.0**（`node -v` 检查）
-- npm（随 Node 自带）
-- 一个 LLM provider 的 API key
-  - Anthropic / OpenAI / DeepSeek / 任意 OpenAI-compatible 端点 / Ollama 本地都可以
+开始前请确认本机已安装：
 
-## 2. 安装
+- Node.js 20.6 或更高版本；
+- npm；
+- Python 3；
+- 可用的大语言模型服务 API Key。
 
-```bash
-git clone <your-repo-url> inno-agent
-cd inno-agent
+项目不会提供 API Key。请使用自己的模型服务配置，并且不要将任何真实密钥上传至 GitHub。
 
-npm install      # 会从 npm 拉 PI SDK，约 60s
-npm run build    # 编译 backend + 前端，约 10s
+## 2. 获取并安装项目
+
+在 PowerShell 中执行：
+
+```powershell
+git clone https://github.com/Renee662/inno-agent-data-analysis-assistant.git
+cd inno-agent-data-analysis-assistant
+
+npm.cmd ci
+npm.cmd run build
 ```
 
-## 3. 配置 API key
+构建成功后，后端与前端文件均已准备完成。
 
-```bash
-mkdir -p runtime/config runtime/data runtime/skills workspace
-cp config.example.json runtime/config/config.json
+## 3. 创建本地运行目录
+
+```powershell
+New-Item -ItemType Directory -Force runtime\config, runtime\data, runtime\skills, workspace
+Copy-Item config.example.json runtime\config\config.json
 ```
 
-编辑 `runtime/config/config.json`，把 `apiKey` 换成你自己的。下面三个例子任选一个：
+随后在本地编辑 `runtime\config\config.json`，根据 `config.example.json` 的字段说明填写模型服务地址、模型名称和 API Key。
 
-**Anthropic 官方**
+`runtime/`、`workspace/`、`.env` 均为本地运行目录或文件，请勿提交至仓库。
 
-```json
-{
-  "defaultProvider": "anthropic",
-  "defaultModel": "claude-sonnet-4-6",
-  "providers": {
-    "anthropic": {
-      "baseUrl": "https://api.anthropic.com",
-      "api": "anthropic-messages",
-      "apiKey": "sk-ant-...",
-      "models": [{ "id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6" }]
-    }
-  },
-  "server": { "port": 3000 }
-}
+## 4. 启动服务
+
+```powershell
+npm.cmd run server -- --home ./runtime --workspace ./workspace --port 3000
 ```
 
-**OpenAI / DeepSeek（OpenAI-compatible）**
+启动完成后，浏览器访问：
 
-```json
-{
-  "defaultProvider": "deepseek",
-  "defaultModel": "deepseek-chat",
-  "providers": {
-    "deepseek": {
-      "baseUrl": "https://api.deepseek.com",
-      "api": "openai-completions",
-      "apiKey": "sk-...",
-      "models": [{ "id": "deepseek-chat", "name": "DeepSeek Chat" }]
-    }
-  },
-  "server": { "port": 3000 }
-}
+```text
+http://localhost:3000
 ```
 
-**InnoSpark（默认模板）**
+在欢迎页或工作区预设列表中选择“数据分析助手”，即可开始使用。
 
-直接用 `config.example.json` 的内容，把 `apiKey` 字段填上即可。
+## 5. 首次使用数据分析能力
 
-## 4. 启动
+首次执行统计分析时，系统会按提示创建本地 Python 环境并安装所需依赖。请保持网络可用，并按界面提示完成环境准备。
 
-```bash
-npm run server -- --home ./runtime --workspace ./workspace --port 3000
+如需提前安装数据分析环境，可执行：
+
+```powershell
+$env:INNO_DATA_DIR = "$PWD\runtime\data"
+node apps/inno-agent/scripts/setup-data-analysis-env.mjs
 ```
 
-打开 **http://localhost:3000**。
+## 6. 使用流程
 
-## 5. 验证
+1. 进入“数据分析助手”工作区；
+2. 上传可公开、已脱敏的 CSV 或 Excel 数据；
+3. 描述研究问题、目标变量和期望分析方向；
+4. 查看并确认数据准备方案；
+5. 查看并确认分析任务与模型方案；
+6. 获取探索性分析、模型诊断和最终 HTML 报告。
 
-```bash
-curl http://localhost:3000/health
-# {"status":"ok"}
+系统会将原始输入、中间分析文件和最终报告按会话分别保存；请勿将含隐私信息的数据上传到公开环境。
+
+## 7. 运行测试
+
+完成 Python 环境准备后，可执行：
+
+```powershell
+npm.cmd run test:data-analysis
 ```
 
-在浏览器里发一条消息试试，比如 `"列出当前 workspace 里的文件"`。
+该命令会重新构建项目，并运行数据分析助手的自动化冒烟测试。
 
----
+## 8. 常见问题
 
-## 其它常用命令
+**构建后找不到页面或后端未更新**
 
-**CLI 模式**（终端里直接对话，不开 HTTP）：
+重新执行：
 
-```bash
-npm run start -- --home ./runtime --workspace ./workspace
+```powershell
+npm.cmd run build
 ```
 
-**开发模式**（前端 Vite HMR，需要两个终端）：
+然后停止并重新启动服务。
 
-```bash
-npm run dev:server     # 终端 1 — backend :3000
-npm run web:dev        # 终端 2 — Vite :5173（代理 /api 到 :3000）
+**端口 3000 被占用**
+
+改用其他端口，例如：
+
+```powershell
+npm.cmd run server -- --home ./runtime --workspace ./workspace --port 3001
 ```
 
-打开 **http://localhost:5173**。
+随后访问 `http://localhost:3001`。
 
-**一键脚本**（封装了 build / start / stop / status / logs / smoke）：
+**Python 环境安装失败**
 
-```bash
-./restart-dev.sh              # build + dev 模式起前后端
-./restart-dev.sh --skip-build # 跳过编译直接重启
-./restart-dev.sh status       # 看进程和健康状态
-./restart-dev.sh logs server  # 跟 backend 日志
-./restart-dev.sh smoke        # 跑一遍 health/session/WS 冒烟测试
-./restart-dev.sh stop         # 停掉所有
-./restart-dev.sh --help       # 全部选项
-```
-
----
-
-## 常见问题
-
-**端口被占？** 加 `--port 3001`，或 `./restart-dev.sh --port 3001`。
-
-**`apps/inno-agent/dist` 不存在？** 跑 `npm run build`。
-
-**修改了 backend 代码不生效？** backend 跑的是编译后的 `dist/`，需要重新 `npm run build` 再重启。前端在 `web:dev` 下走 Vite HMR，改完直接刷新即可。
-
-**想换 provider？** 改 `runtime/config/config.json` 的 `defaultProvider` 和 `defaultModel`，或者在 Web UI 顶部模型选择器里切——切换会自动写回 config 文件。
-
-**想看 backend 日志？** `tail -f runtime/logs/server.log`（用 `restart-dev.sh` 启动的话日志在这里）。
-
----
-
-## 下一步
-
-- 完整文档见 [README.md](./README.md)
-- 自定义 skill：把 `<skill-name>.zip` 通过 Web UI 的 Skills 页面上传，或直接放进 `runtime/skills/<name>/`
-- 配 Feishu / WeChat 渠道：编辑 `runtime/config/config.json` 的 `channels` 块
-- 部署到生产：参考 README 的 Production Shape 一节，或用 `Dockerfile` / `docker-compose.yml`
+确认本机已安装 Python 3，并重新执行“首次使用数据分析能力”中的环境准备命令。
