@@ -1,315 +1,137 @@
-# Inno Agent
+# Inno Agent 数据分析助手
 
-> An open-source **personal learning agent** with a layered memory system, a proactive scheduler, multi-channel messaging, and a workspace-scoped Practice Lab — built on the [Pi coding-agent SDK](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) **without modifying its kernel**.
+> 基于 [Inno Agent](https://github.com/hhyqhh/inno-agent) 二次开发的智能数据分析工作区，面向结构化数据分析任务，提供从数据导入、探索性分析到统计建模、诊断与报告生成的可追溯工作流。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
-[![Node](https://img.shields.io/badge/node-%3E%3D20.6.0-brightgreen.svg)](https://nodejs.org)
-[![TypeScript](https://img.shields.io/badge/TypeScript-ESM-3178c6.svg)](https://www.typescriptlang.org/)
-[![Website](https://img.shields.io/badge/Website-Inno%20Agent-ff6b35.svg)](https://hhyqhh.github.io/inno-agent-website/)
+[![Node](https://img.shields.io/badge/Node-%3E%3D20.6.0-brightgreen.svg)](https://nodejs.org/)
+[![Python](https://img.shields.io/badge/Python-3.x-blue.svg)](https://www.python.org/)
 
-> 🌐 **Homepage:** [https://hhyqhh.github.io/inno-agent-website/](https://hhyqhh.github.io/inno-agent-website/) - project overview, feature walkthrough, and live demos.
+## 项目简介
 
-> 📄 **Technical Report:** [*Inno Agent: An Open-Source Personal Learning Agent with Layered Memory, Educational Post-Training, and Local Deployment*](./docs/inno-agent.pdf) (arXiv, June 2026) — covers the system design, three-layer memory architecture, instructional-design grounding, and preliminary educational post-training results on Qwen3.6 35B.
->
-> 📦 **Resource Hub:** [Chloris-Blaxk/inno-agent-hub](https://github.com/Chloris-Blaxk/inno-agent-hub) — the companion repository containing the skill library, workspace preset templates, and community-contributed resources for Inno Agent.
+本项目将数据分析助手集成到 Inno Agent 的工作区预设体系中。用户可在网页端选择“数据分析助手”工作区，上传结构化数据并以自然语言描述研究问题；助手会在明确数据质量、变量角色和分析目标后，按规范化流程完成数据准备、统计分析、模型诊断与最终报告输出。
 
-<p align="center">
-  <img src="./docs/assets/l2-wiki.png" alt="Inno Agent — L2 wiki knowledge base and graph" width="100%" />
-</p>
+项目强调以下原则：
 
-Inno Agent is a single-learner companion that organizes long-term learning support into three explicit memory layers — an **L1 learner profile**, an **L2 native wiki knowledge base**, and **L3 session records with cross-conversation retrieval** — and wraps them with a learning loop: a cron scheduler, personal IM channels (Feishu / WeChat), and a Practice Lab with an in-browser terminal.
+- 数据处理与建模方案在执行前清晰呈现；
+- 区分事实、统计推断与不确定性；
+- 对缺失数据、共线性、类别样本量、模型假设和诊断结果进行约束检查；
+- 保留可复现的中间产物、分析脚本与报告清单；
+- 不将 API Key、用户上传数据、会话记录或运行时缓存提交到仓库。
 
-It ships in two forms that share the same `runtime/` and `workspace/` state:
+## 核心能力
 
-- **Terminal CLI** (`inno`) — a pure TUI agent, no HTTP.
-- **Web UI** (React 19 + Lit + Tailwind 4) — backed by a Node HTTP server with SSE streaming, terminal sessions, a workspace browser, the wiki graph, jobs, skills, and settings.
+- **数据理解与质量检查**：识别表格结构、变量角色、缺失情况、重复值和异常输入。
+- **探索性分析**：生成面向研究问题的描述统计、分布、分组比较与关联分析建议。
+- **规范化数据准备**：在确认方案后执行清洗、变量转换与数据派生，并保留过程记录。
+- **统计建模与诊断**：支持回归、分类、计数与有序结果等常见分析路径，并对模型适用条件、非线性、过度离散、零膨胀、比例优势等风险进行检查。
+- **可解释结果输出**：生成包含分析方法、关键发现、局限性与风险提示的最终 HTML 报告。
+- **完整交互支持**：包括数据上传、用户确认、流式输出、工作区预设选择及中文/英文界面文案。
 
----
-
-## Why Inno Agent
-
-General-purpose coding agents are optimized for open-ended, context-heavy software engineering, which pushes them toward the largest models and longest context windows. Education is a different optimization target: the tasks are more structured, and the value lies in **personalized explanation, misconception diagnosis, exercise generation, feedback, review scheduling, privacy, and low-latency continuous interaction**.
-
-Inno Agent takes a different stance:
-
-- **Layered memory, not a flat chat summary.** Learner state, archived knowledge, and recent dialogue have different lifecycles, so each lives in its own layer with explicit boundaries enforced in the system prompt and storage layout.
-- **Durable facts go to tools, not replies.** Anything that affects future teaching is written to L1/L2 via tools, so personalization decisions are evidence-driven and traceable.
-- **An open, correctable learner model.** The L1 profile is inspectable and editable by the learner; the system prompt forbids unevidenced labels.
-- **The SDK kernel is never modified.** All learning behavior is added through registered tools and a single extension hook (`createInnoExtension`), so the agent runtime stays upstream-compatible.
-
----
-
-## Features
-
-- 🧠 **Three-layer memory**
-  - **L1 — Learner profile**: goals, knowledge states, misconceptions, and preferences, updated from structured learning events and summarized into a short context pack injected before each turn.
-  - **L2 — Native wiki**: human-readable, agent-queryable pages (sources, concepts, entities, analysis) with LLM-assisted summarization, entity/concept linking, and PDF/Office/image ingestion.
-  - **L3 — Session records + cross-conversation retrieval**: Pi-SDK session history, indexed into SQLite with threshold-gated lexical recall so relevant past conversations can be surfaced across sessions.
-- ⏰ **Proactive scheduler** — cron-driven background jobs created in natural language, runnable from the agent, the UI, or the cron daemon.
-- 💬 **Personal IM channels** — Feishu (native) plus WeChat (bridge mode), with a unified dispatcher that pushes reminders back out.
-- 🧪 **Practice Lab** — a workspace-scoped web terminal (xterm.js over WebSocket) with run records the agent can read.
-- 🔌 **Pluggable providers** — any `openai-completions` or `anthropic-messages` endpoint (Anthropic, OpenAI, DeepSeek, Ollama, or a local model); switch models live in the UI.
-- 🖥️ **CLI and Web UI** — same runtime, same memory, same skills.
-- 🛡️ **Optional OS-level sandbox** — gate the agent's bash and file operations via [pi-sandbox](https://github.com/carderne/pi-sandbox).
-
----
-
-## Requirements
-
-- **Node.js >= 20.6.0** (cross-conversation L3 retrieval uses the built-in `node:sqlite`, available on Node 22.5+; on older runtimes L3 recall degrades gracefully and the rest of the agent runs normally).
-- **npm** (workspaces are used; no extra package manager required).
-
----
-
-## Quick Start
-
-New here? Start with **[QUICKSTART.md](./QUICKSTART.md)** (5 minutes). The short version:
-
-```bash
-git clone https://github.com/hhyqhh/inno-agent.git
-cd inno-agent
-
-npm install      # pulls the Pi SDK from npm
-npm run build    # compiles backend + web
-
-mkdir -p runtime/config runtime/data runtime/skills workspace
-cp config.example.json runtime/config/config.json
-# Edit runtime/config/config.json and set providers[*].apiKey
-
-npm run server -- --home ./runtime --workspace ./workspace --port 3000
-```
-
-Open **http://localhost:3000**.
-
----
-
-## Use Cases
-
-Real-world usage guides live in [`docs/use-cases/`](https://github.com/hhyqhh/inno-agent/tree/main/docs/use-cases).
-
-| Guide | Description |
-|---|---|
-| [Skill Tutorial — Building a Workspace Agent](./docs/use-cases/skill-tutorial.md) | Use `agent.md` and `.skills/` to build a custom learning agent scoped to a workspace, with a concrete English study example |
-
----
-
-## Run Modes
-
-**Web UI** (serves the API and the built frontend):
-
-```bash
-npm run server -- --home ./runtime --workspace ./workspace --port 3000
-```
-
-**CLI** (terminal agent, no HTTP):
-
-```bash
-npm run start -- --home ./runtime --workspace ./workspace
-```
-
-**Dev** (backend + Vite HMR on :5173, with `/api` proxied to :3000):
-
-```bash
-npm run dev:server     # backend
-npm run web:dev        # frontend
-```
-
-**Sandbox** (OS-level isolation of bash/file operations; requires `ripgrep`):
-
-```bash
-npm run server:sandbox -- --home ./runtime --workspace ./workspace --port 3000
-```
-
-The included `restart-dev.sh` orchestrates both processes (build, start, stop, status, logs, smoke-test). Run `bash restart-dev.sh --help`.
-
----
-
-## Configuration
-
-`runtime/config/config.json` (template: [`config.example.json`](./config.example.json)):
-
-```json
-{
-  "defaultProvider": "innospark",
-  "defaultModel": "claude-sonnet-4-6",
-  "providers": {
-    "innospark": {
-      "baseUrl": "https://api.example.com",
-      "api": "anthropic-messages",
-      "apiKey": "replace-me",
-      "models": [{ "id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6" }]
-    }
-  },
-  "server": { "port": 3000 },
-  "channels": {
-    "feishu": { "enabled": false },
-    "wechat": { "enabled": false, "mode": "bridge", "sidecarBaseUrl": "http://127.0.0.1:4319" }
-  }
-}
-```
-
-Each provider has a `baseUrl`, an `api` (`openai-completions` or `anthropic-messages`), an `apiKey`, and a `models[]` list. The server hot-rewrites this file when you switch model in the UI.
-
-### Runtime path resolution
-
-Both CLI and server resolve paths through `apps/inno-agent/src/runtime.ts`. Precedence: **CLI flag > env var > `~/.inno-agent/...`**.
-
-| CLI flag                          | Env var                | Default                   |
-| --------------------------------- | ---------------------- | ------------------------- |
-| `--home`                          | `INNO_HOME`            | `~/.inno-agent`           |
-| `--config`                        | `INNO_CONFIG_FILE`     | `<configDir>/config.json` |
-| `--config-dir`                    | `INNO_CONFIG_DIR`      | `<home>/config`           |
-| `--data` / `--data-dir`           | `INNO_DATA_DIR`        | `<home>/data`             |
-| `--skills` / `--skills-dir`       | `INNO_SKILLS_DIR`      | `<home>/skills`           |
-| `--workspace` / `--workspace-dir` | `INNO_WORKSPACE_DIR`   | invocation CWD            |
-| `--port`                          | `INNO_PORT` (`config`) | `3000`                    |
-
-### Content Hub (skill library + workspace presets)
-
-The global **skill library** and the Simple Mode **workspace presets** (an `agent.md` + `.skills/` bundle, surfaced as one-click cards on the welcome screen) are both fetched from a remote **content hub**. By default this is the public GitHub repo [`Chloris-Blaxk/inno-agent-hub`](https://github.com/Chloris-Blaxk/inno-agent-hub); you can point it at a private GitHub repo or a self-hosted bundle service instead — a config change, no code change.
-
-Configure it in `runtime/config/config.json` (or via the UI: **Settings → Content Hub**):
-
-```jsonc
-// Default: pull from a GitHub repo
-{
-  "contentHub": {
-    "type": "github",
-    "owner": "Chloris-Blaxk",
-    "repo": "inno-agent-hub",
-    "ref": "main",
-    "skillsPath": "skill-library",        // dir holding <skill>/SKILL.md
-    "presetsPath": "workspace-templates",  // dir holding <preset>/preset.json
-    "token": ""                            // optional PAT: private repos / higher rate limit
-  }
-}
-```
-
-```jsonc
-// Or: pull from a self-hosted bundle service (private deployments)
-{
-  "contentHub": {
-    "type": "bundle",
-    "baseUrl": "http://localhost:8787",
-    "token": ""                            // optional Bearer credential
-  }
-}
-```
-
-Presets are downloaded on first use and cached under `<dataDir>/preset-cache/`; the templates bundled with the app serve as an offline fallback. A legacy `github.token` is migrated into `contentHub.token` automatically.
-
-**Self-hosting:** a zero-dependency local bundle service lives in [`scripts/content-hub-server/`](./scripts/content-hub-server/) — back it with your private git repo of skills + templates. See its [README](./scripts/content-hub-server/README.md) for the layout and run commands:
-
-```bash
-CONTENT_DIR=/path/to/content node scripts/content-hub-server/server.mjs
-```
-
----
-
-## Repository Layout
+## 工作流程
 
 ```text
-apps/inno-agent/          Backend (CLI + HTTP server), TypeScript -> dist/
-apps/inno-agent/web/      Frontend (React 19 + Lit + Tailwind 4 + Vite)
-scripts/content-hub-server/  Self-hosted Content Hub bundle service (skills + presets)
-runtime/                  Local runtime state (config, data, skills) - gitignored
-workspace/                Default agent working directory - gitignored
+研究问题与数据上传
+          ↓
+数据结构识别与探索性分析
+          ↓
+数据准备方案确认 → 数据清洗与派生
+          ↓
+分析任务与模型方案确认
+          ↓
+统计建模、诊断与稳健性检查
+          ↓
+最终报告与结果清单输出
 ```
 
-The Pi SDK packages (`@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, `@earendil-works/pi-web-ui`) are pulled from npm.
+每次分析的产物按会话分开保存：原始输入保持只读，中间文件存放在 `work/`，最终报告和清单存放在 `outputs/`。
 
----
-
-## Architecture
-
-Inno Agent is a single-user system with four layers: **user interfaces → application layer → Pi agent runtime → layered memory.**
+## 项目结构
 
 ```text
-User Interfaces      CLI · Web UI (React) · Feishu · WeChat
-        ↓
-Application Layer    Channel adapters · HTTP API (SSE) · Memory orchestration
-                     Cron scheduler · Practice Lab · WebSocket terminal
-        ↓
-Agent Runtime        Pi AgentSession · registered tools · inno extension
-(Pi SDK, unmodified) General LLM provider  ──or──  distilled educational model
-        ↓
-Layered Memory       L1 learner profile · L2 native wiki · L3 session records
+apps/inno-agent/
+├─ presets/data-analysis-assistant/  # 数据分析助手预设、Skills 和报告模板
+├─ scripts/                          # Python 环境安装与自动化冒烟测试
+├─ src/agent/                        # 运行策略、环境管理、确认与输出逻辑
+└─ web/src/                          # 上传、工作区选择和对话交互界面
 ```
 
-- **Agent core** — `@earendil-works/pi-coding-agent` provides the loop. Inno wraps it with `apps/inno-agent/src/agent/inno-extension.ts`, which registers providers and tools (L1 learner, L2 wiki, L3 recall, scheduler, practice lab) and a `before_agent_start` hook that injects the L1 context pack — and, when relevant, threshold-gated L3 recall — into the system prompt.
-- **L1 — learner memory** (`src/memory/learner/`): evidence-driven profile + event log, summarized into a `ContextPack` per turn.
-- **L2 — wiki memory** (`src/memory/l2/`): structured wiki pages with frontmatter, links, graph, summarizer, and document ingestion; exposed as agent tools and via `/api/wiki/*`.
-- **L3 — session memory** (`src/memory/l3/` + Pi `SessionManager`): the SDK owns session JSONL files; Inno layers a SQLite index (`node:sqlite` + FTS5) on top for cross-conversation recall, surfaced both automatically (above a relevance threshold) and via the `l3_recall` tool.
-- **Scheduler** (`src/scheduler/`): cron jobs persisted to `jobs.json` + `runs.jsonl`; runnable from the agent (`run_scheduled_job`), the UI, or the daemon.
-- **Channels** (`src/channels/`): `ChannelRegistry` with Feishu (and bridge-mode WeChat) so reminders can be pushed back out.
-- **HTTP server** (`src/server.ts`): plain Node `http.createServer` with SSE for chat streaming and WebSocket for the in-browser terminal.
-- **Web UI** (`web/src/`): React 19 + Lit + Tailwind 4. State lives in framework-agnostic `EventEmitter` stores under `web/src/stores/`; REST/SSE calls in `web/src/api/`.
-
-The backend API route table and runtime details are in [`apps/inno-agent/README.md`](./apps/inno-agent/README.md).
-
----
-
-## Deployment
-
-A typical production layout separates code, config, data, and workspace:
+其中，数据分析助手预设位于：
 
 ```text
-/opt/inno-agent              # this repository
-/etc/inno-agent/config.json  # config
-/var/lib/inno-agent/data     # sessions, jobs, memory, downloads
-/var/lib/inno-agent/skills   # uploaded skills
-/srv/inno-workspace          # files the agent should work on
+apps/inno-agent/presets/data-analysis-assistant/
 ```
 
-```bash
-INNO_CONFIG_DIR=/etc/inno-agent \
-INNO_DATA_DIR=/var/lib/inno-agent/data \
-INNO_SKILLS_DIR=/var/lib/inno-agent/skills \
-INNO_WORKSPACE_DIR=/srv/inno-workspace \
-INNO_PORT=3000 \
-npm run server
+## 快速启动
+
+### 1. 环境要求
+
+- Node.js 20.6 或更高版本；
+- npm；
+- Python 3（首次使用数据分析能力或执行测试时需要）；
+- 自行配置可用的大语言模型服务。项目不提供 API Key。
+
+### 2. 安装并构建
+
+在项目根目录执行：
+
+```powershell
+npm.cmd ci
+npm.cmd run build
 ```
 
-A [`Dockerfile`](./Dockerfile) and [`docker-compose.yml`](./docker-compose.yml) are provided as starting points.
+### 3. 准备本地运行目录
 
----
-
-## Contributing
-
-Issues and PRs are welcome. Before opening a PR, please run `npm run build` locally — there is no top-level lint or test runner wired up yet, but the TypeScript build doubles as a sanity check. Keep changes focused, match the existing code style, and update the relevant docs when behavior changes.
-
----
-
-## Community
-
-Join the WeChat user group to ask questions, share use cases, and follow updates. Scan the QR code below:
-
-<p align="center">
-  <img src="./docs/assets/wechat-community-qr.png" alt="Inno Agent WeChat community group QR code" width="240" />
-</p>
-
----
-
-## License
-
-[MIT](./LICENSE).
-
-This project depends on the Pi SDK (`@earendil-works/pi-*` packages by Mario Zechner), which is also MIT-licensed and consumed via npm.
-
----
-
-## Citation
-
-If you use Inno Agent in your research, please cite it as follows:
-
-```bibtex
-@misc{hao2026innoagent,
-  author       = {Hao Hao, Ye Lu, Ruotong Yang, Yongheng Guo and Aimin Zhou},
-  title        = {Inno Agent: An Open-Source Personal Learning Agent with Layered Memory, Educational Post-Training, and Local Deployment},
-  year         = {2026},
-  publisher    = {GitHub},
-  journal      = {GitHub repository},
-  howpublished = {\url{https://github.com/hhyqhh/inno-agent}},
-  note         = {Accessed: 2026-07-17}
-}
+```powershell
+New-Item -ItemType Directory -Force runtime\config, runtime\data, runtime\skills, workspace
+Copy-Item config.example.json runtime\config\config.json
 ```
+
+随后根据 `config.example.json` 的字段说明，在本地配置模型服务与 API Key。请勿提交 `runtime/config/config.json`、`.env` 或任何真实凭据。
+
+### 4. 启动服务
+
+```powershell
+npm.cmd run server -- --home ./runtime --workspace ./workspace --port 3000
+```
+
+浏览器访问 [http://localhost:3000](http://localhost:3000)，在预设工作区中选择“数据分析助手”即可开始使用。
+
+### 5. 首次准备 Python 分析环境（可选）
+
+首次执行统计分析时，系统会按提示创建本地 Python 环境。也可以预先执行：
+
+```powershell
+$env:INNO_DATA_DIR = "$PWD\runtime\data"
+node apps/inno-agent/scripts/setup-data-analysis-env.mjs
+```
+
+## 测试
+
+执行完整构建与数据分析助手冒烟测试：
+
+```powershell
+npm.cmd run test:data-analysis
+```
+
+测试覆盖数据分析工作流、用户确认、变量支持、模型选择、模型诊断、报告输出和运行策略等关键路径。
+
+## 安全与隐私
+
+以下目录和文件仅用于本地运行，已通过 `.gitignore` 排除，不应提交到仓库：
+
+```text
+runtime/
+workspace/
+tmp/
+work/
+.env
+node_modules/
+```
+
+使用公开数据进行演示时，也应确认数据可公开、已脱敏且符合其许可证要求。
+
+## 致谢与许可证
+
+本项目基于 [hhyqhh/inno-agent](https://github.com/hhyqhh/inno-agent) 进行二次开发，保留原项目的 [MIT License](./LICENSE)。
+
+Inno Agent 提供 Agent 运行时、工作区与预设机制、前后端基础能力；本项目在此基础上实现并集成数据分析助手工作区及其分析流程、统计检查与测试支持。
